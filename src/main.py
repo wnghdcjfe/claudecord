@@ -12,9 +12,10 @@ from src.greetings import direct_reply_for
 from src.orchestrator import create_job, run_job
 from src.outputs import send_outputs
 from src.parser import parse
-from src.sessions import clear_session, get_session, set_session
+from src.sessions import clear_session, get_session_state, set_session
 from src.status import (
     format_working_status,
+    make_working_gif_file,
     run_spinning_loader,
     stop_spinning_loader,
 )
@@ -50,6 +51,17 @@ async def _run_job_with_session_recovery(
     return meta
 
 
+def _resolve_resume_and_workdir(cmd, channel_id: int) -> tuple[str | None, str | None, bool]:
+    explicit_session = cmd.session_id is not None
+    if explicit_session:
+        return cmd.session_id, cmd.workdir, True
+
+    session_state = get_session_state(channel_id)
+    resume_id = session_state.session_id if session_state else None
+    workdir = cmd.workdir or (session_state.workdir if session_state else None)
+    return resume_id, workdir, False
+
+
 @client.event
 async def on_ready():
     print(f"[bot] logged in as {client.user}")
@@ -75,16 +87,23 @@ async def on_message(msg: discord.Message):
         return
 
     cmd = parse(text)
+    resume_id, workdir, explicit_session = _resolve_resume_and_workdir(cmd, msg.channel.id)
     try:
-        job_dir = create_job(cmd.prompt, cmd.workdir, cmd.system_hint)
+        job_dir = create_job(cmd.prompt, workdir, cmd.system_hint)
     except ValueError as exc:
-        await msg.reply(f"실행 불가: {exc}")
-        return
+        if resume_id and workdir and cmd.workdir is None and not explicit_session:
+            clear_session(msg.channel.id)
+            resume_id = None
+            job_dir = create_job(cmd.prompt, None, cmd.system_hint)
+        else:
+            await msg.reply(f"실행 불가: {exc}")
+            return
 
-    explicit_session = cmd.session_id is not None
-    resume_id = cmd.session_id or get_session(msg.channel.id)
-
-    ack = await msg.reply(format_working_status(job_dir.name))
+    working_gif = make_working_gif_file()
+    if working_gif:
+        ack = await msg.reply(format_working_status(job_dir.name), file=working_gif)
+    else:
+        ack = await msg.reply(format_working_status(job_dir.name))
     loader_task = asyncio.create_task(run_spinning_loader(ack, job_dir.name))
 
     try:
@@ -103,7 +122,7 @@ async def on_message(msg: discord.Message):
     await stop_spinning_loader(loader_task)
 
     if meta.get("session_id"):
-        set_session(msg.channel.id, meta["session_id"])
+        set_session(msg.channel.id, meta["session_id"], workdir=meta.get("workdir"))
 
     failed = meta.get("type") == "error" or meta.get("is_error")
     status = "작업 실패" if failed else "작업 완료"

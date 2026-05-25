@@ -1,8 +1,11 @@
 import asyncio
+from pathlib import Path
 
 import discord
 
-WORKING_MESSAGE = "열심히 작업중입니다."
+WORKING_MESSAGE = "작업중입니다."
+WORKING_GIF_PATH = Path(__file__).resolve().parents[1] / "working_m.gif"
+WORKING_GIF_FILENAME = "working_m.gif"
 SPINNER_INTERVAL_SECONDS = 1.2
 STATUS_FRAMES = (
     ("⚙️", "▰▱▱▱▱", "요청을 정리하는 중"),
@@ -11,6 +14,12 @@ STATUS_FRAMES = (
     ("🚧", "▰▰▰▰▱", "꼼꼼히 확인하는 중"),
     ("✨", "▰▰▰▰▰", "마무리하는 중"),
 )
+
+
+def make_working_gif_file() -> discord.File | None:
+    if not WORKING_GIF_PATH.is_file():
+        return None
+    return discord.File(WORKING_GIF_PATH, filename=WORKING_GIF_FILENAME)
 
 
 def format_working_status(job_name: str, frame_index: int = 0) -> str:

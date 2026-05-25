@@ -4,9 +4,53 @@ from pathlib import Path
 from unittest import mock
 
 import src.main as main
+from src.parser import Command
+from src.sessions import SessionState
 
 
 class MainSessionRecoveryTests(unittest.TestCase):
+    def test_resolve_resume_and_workdir_uses_recent_channel_session(self):
+        with mock.patch.object(
+            main,
+            "get_session_state",
+            return_value=SessionState("sess-1", workdir="/tmp/project"),
+        ):
+            resume_id, workdir, explicit_session = main._resolve_resume_and_workdir(
+                Command(prompt="계속"),
+                123,
+            )
+
+        self.assertEqual(resume_id, "sess-1")
+        self.assertEqual(workdir, "/tmp/project")
+        self.assertFalse(explicit_session)
+
+    def test_resolve_resume_and_workdir_keeps_command_workdir_over_session_workdir(self):
+        with mock.patch.object(
+            main,
+            "get_session_state",
+            return_value=SessionState("sess-1", workdir="/tmp/old"),
+        ):
+            resume_id, workdir, explicit_session = main._resolve_resume_and_workdir(
+                Command(prompt="계속", workdir="/tmp/new"),
+                123,
+            )
+
+        self.assertEqual(resume_id, "sess-1")
+        self.assertEqual(workdir, "/tmp/new")
+        self.assertFalse(explicit_session)
+
+    def test_resolve_resume_and_workdir_ignores_cached_state_for_explicit_session(self):
+        with mock.patch.object(main, "get_session_state") as get_session_state:
+            resume_id, workdir, explicit_session = main._resolve_resume_and_workdir(
+                Command(prompt="계속", session_id="sess-manual"),
+                123,
+            )
+
+        get_session_state.assert_not_called()
+        self.assertEqual(resume_id, "sess-manual")
+        self.assertIsNone(workdir)
+        self.assertTrue(explicit_session)
+
     def test_missing_conversation_error_is_detected(self):
         self.assertTrue(
             main._is_missing_conversation_error(
@@ -88,4 +132,3 @@ class MainSessionRecoveryTests(unittest.TestCase):
         self.assertEqual(calls, ["stale"])
         clear_session.assert_not_called()
         self.assertEqual(meta["type"], "error")
-

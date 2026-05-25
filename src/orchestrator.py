@@ -7,6 +7,7 @@ from pathlib import Path
 from src.runner import run_claude_stream
 
 JOB_META = "job.json"
+SESSION_STATE = "session_state.json"
 
 
 def get_runs_dir() -> Path:
@@ -26,6 +27,31 @@ def _resolve_target_workdir(workdir: str | None) -> Path | None:
 def _write_event(job_dir: Path, event: dict) -> None:
     with (job_dir / "logs" / "stream.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _read_continuation_workdir(job_dir: Path, default_workdir: Path) -> Path:
+    state_path = job_dir / SESSION_STATE
+    if not state_path.exists():
+        return default_workdir.resolve()
+
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_workdir.resolve()
+
+    if not isinstance(state, dict):
+        return default_workdir.resolve()
+
+    workdir = state.get("workdir")
+    if not isinstance(workdir, str) or not workdir.strip():
+        return default_workdir.resolve()
+
+    candidate = Path(workdir).expanduser()
+    if not candidate.is_absolute():
+        candidate = default_workdir / candidate
+    if not candidate.is_dir():
+        return default_workdir.resolve()
+    return candidate.resolve()
 
 
 def create_job(user_text: str, workdir: str | None, system_hint: str | None) -> Path:
@@ -57,6 +83,10 @@ def create_job(user_text: str, workdir: str | None, system_hint: str | None) -> 
 - 소스 수정이 필요하면 Claude CLI 작업 디렉터리 내부에서만 변경한다.
 - 보고/첨부 산출물은 Discord 보고/첨부 산출물 디렉터리 내부에만 저장한다.
 - 위 두 디렉터리 밖에는 쓰지 않는다.
+- 작업 완료 직전 다음 메시지에서 이어서 실행할 작업 디렉터리를
+  {job_dir}/{SESSION_STATE} 파일에 반드시 기록한다. 형식:
+  {{ "workdir": "<현재 또는 이어갈 절대경로>" }}
+- 사용자가 `cd a`처럼 이동을 지시했다면 이동 후 절대경로를 workdir에 기록한다.
 """
     if system_hint:
         prompt = system_hint + "\n\n" + prompt
@@ -110,4 +140,5 @@ async def run_job(job_dir: Path, resume: str | None = None) -> dict:
         _write_event(job_dir, event)
 
     last_meta["session_id"] = session_id
+    last_meta["workdir"] = str(_read_continuation_workdir(job_dir, claude_cwd))
     return last_meta
