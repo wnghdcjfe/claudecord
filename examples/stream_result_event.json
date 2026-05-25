@@ -1,0 +1,10 @@
+{
+  "type": "result",
+  "subtype": "success",
+  "total_cost_usd": 0.0123,
+  "is_error": false,
+  "duration_ms": 4218,
+  "num_turns": 6,
+  "session_id": "abc12345-...",
+  "result": "..."
+}
