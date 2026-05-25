@@ -18,7 +18,12 @@ SVG_FENCE_RE = re.compile(
 )
 
 
-async def send_outputs(channel: discord.abc.Messageable, job_dir: Path):
+async def send_outputs(
+    channel: discord.abc.Messageable,
+    job_dir: Path,
+    *,
+    warn_missing_manifest: bool = True,
+):
     attachment_entries = []
     output_md = job_dir / "output.md"
     if output_md.exists():
@@ -31,7 +36,7 @@ async def send_outputs(channel: discord.abc.Messageable, job_dir: Path):
     manifest_path = job_dir / "manifest.json"
     if not manifest_path.exists():
         await _send_attachment_entries(channel, job_dir, attachment_entries)
-        if not attachment_entries:
+        if warn_missing_manifest and not attachment_entries:
             await channel.send("(manifest.json이 없습니다. 산출 파일을 확인할 수 없음.)")
         return
 

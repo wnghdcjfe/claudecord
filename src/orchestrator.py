@@ -10,7 +10,7 @@ JOB_META = "job.json"
 
 
 def get_runs_dir() -> Path:
-    return Path(os.environ.get("RUNS_DIR", "~/.discord-claude/runs")).expanduser()
+    return Path(os.environ.get("RUNS_DIR", "~/.claudecord/runs")).expanduser()
 
 
 def _resolve_target_workdir(workdir: str | None) -> Path | None:
@@ -85,6 +85,7 @@ async def run_job(job_dir: Path, resume: str | None = None) -> dict:
     job_meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
     claude_cwd = Path(job_meta.get("workdir") or job_dir).expanduser()
     last_meta = {}
+    session_id = None
 
     if not claude_cwd.is_dir():
         event = {
@@ -103,7 +104,10 @@ async def run_job(job_dir: Path, resume: str | None = None) -> dict:
     ):
         if event.get("type") in {"result", "error"}:
             last_meta = event
+        if event.get("session_id"):
+            session_id = event["session_id"]
 
         _write_event(job_dir, event)
 
+    last_meta["session_id"] = session_id
     return last_meta

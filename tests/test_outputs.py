@@ -107,3 +107,15 @@ class OutputTests(unittest.TestCase):
 
         sent = asyncio.run(scenario())
         self.assertTrue(any("manifest.json" in (message["content"] or "") for message in sent))
+
+    def test_send_outputs_can_suppress_missing_manifest_warning(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                job_dir = Path(tmp)
+                (job_dir / "output.md").write_text("부분 결과", encoding="utf-8")
+                channel = FakeChannel()
+                await send_outputs(channel, job_dir, warn_missing_manifest=False)
+                return channel.sent
+
+        sent = asyncio.run(scenario())
+        self.assertEqual([message["content"] for message in sent], ["부분 결과"])
