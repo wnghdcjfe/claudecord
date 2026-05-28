@@ -113,3 +113,10 @@ def clear_session(channel_id: int) -> None:
     store = _load()
     store.pop(str(channel_id), None)
     _save(store)
+
+
+def clear_all_sessions() -> int:
+    store = _load()
+    cleared = len(store)
+    _save({})
+    return cleared

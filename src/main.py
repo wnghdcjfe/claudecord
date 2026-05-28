@@ -12,7 +12,8 @@ from src.greetings import direct_reply_for
 from src.orchestrator import create_job, run_job
 from src.outputs import send_outputs
 from src.parser import parse
-from src.sessions import clear_session, get_session_state, set_session
+from src.runner import TerminationSummary, terminate_active_claude_processes
+from src.sessions import clear_all_sessions, clear_session, get_session_state, set_session
 from src.status import (
     format_working_status,
     make_working_gif_file,
@@ -21,6 +22,7 @@ from src.status import (
 )
 
 MISSING_CONVERSATION_MARKER = "No conversation found with session ID"
+SHUTDOWN_COMMAND = "종료"
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -62,6 +64,30 @@ def _resolve_resume_and_workdir(cmd, channel_id: int) -> tuple[str | None, str |
     return resume_id, workdir, False
 
 
+def _is_shutdown_command(text: str) -> bool:
+    return text.strip() == SHUTDOWN_COMMAND
+
+
+def _format_shutdown_reply(
+    summary: TerminationSummary,
+    *,
+    cleared_sessions: int,
+) -> str:
+    killed_note = f" (강제 종료 {summary.killed}개)" if summary.killed else ""
+    return (
+        "Claude 세션 종료 완료.\n"
+        f"- 실행 중이던 Claude CLI 프로세스: {summary.terminated}/{summary.requested}개 종료"
+        f"{killed_note}\n"
+        f"- 저장된 대화 세션: {cleared_sessions}개 초기화"
+    )
+
+
+async def _shutdown_claude_sessions() -> tuple[TerminationSummary, int]:
+    summary = await terminate_active_claude_processes()
+    cleared_sessions = clear_all_sessions()
+    return summary, cleared_sessions
+
+
 @client.event
 async def on_ready():
     print(f"[bot] logged in as {client.user}")
@@ -79,6 +105,13 @@ async def on_message(msg: discord.Message):
     if text == "/clear":
         clear_session(msg.channel.id)
         await msg.reply("세션을 초기화했습니다. 다음 메시지부터 새 대화로 시작합니다.")
+        return
+
+    if _is_shutdown_command(text):
+        summary, cleared_sessions = await _shutdown_claude_sessions()
+        await msg.reply(
+            _format_shutdown_reply(summary, cleared_sessions=cleared_sessions)
+        )
         return
 
     direct_reply = direct_reply_for(text)

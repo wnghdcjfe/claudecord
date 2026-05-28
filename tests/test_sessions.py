@@ -55,3 +55,16 @@ class SessionsTests(unittest.TestCase):
             self.assertIsNotNone(state)
             self.assertEqual(state.session_id, "legacy-sess")
             self.assertIsNone(state.workdir)
+
+    def test_clear_all_sessions_removes_every_channel_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                sessions.set_session(123, "sess-1", workdir="/tmp/a")
+                sessions.set_session(456, "sess-2", workdir="/tmp/b")
+                cleared = sessions.clear_all_sessions()
+                store = json.loads(store_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(cleared, 2)
+            self.assertEqual(store, {})

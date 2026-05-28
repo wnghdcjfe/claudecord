@@ -6,7 +6,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from src.runner import build_claude_command, run_claude_stream
+from src.runner import (
+    build_claude_command,
+    get_active_claude_process_count,
+    run_claude_stream,
+    terminate_active_claude_processes,
+)
 
 
 class RunnerTests(unittest.TestCase):
@@ -84,3 +89,44 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(events[-1]["returncode"], 7)
 
         asyncio.run(scenario())
+
+    def test_active_claude_processes_can_be_terminated(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                script = Path(tmp) / "claude"
+                script.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, sys, time\n"
+                    "print(json.dumps({'type': 'assistant'}), flush=True)\n"
+                    "time.sleep(30)\n",
+                    encoding="utf-8",
+                )
+                script.chmod(script.stat().st_mode | stat.S_IXUSR)
+                events = []
+
+                async def collect_events():
+                    with mock.patch.dict(
+                        os.environ,
+                        {"PATH": tmp + os.pathsep + os.environ.get("PATH", "")},
+                        clear=False,
+                    ):
+                        async for event in run_claude_stream("hello", workdir=tmp):
+                            events.append(event)
+
+                task = asyncio.create_task(collect_events())
+                for _ in range(100):
+                    if get_active_claude_process_count() and events:
+                        break
+                    await asyncio.sleep(0.01)
+
+                summary = await terminate_active_claude_processes(timeout=1)
+                await asyncio.wait_for(task, timeout=3)
+                return summary, events, get_active_claude_process_count()
+
+        summary, events, active_count = asyncio.run(scenario())
+
+        self.assertEqual(summary.requested, 1)
+        self.assertEqual(summary.terminated, 1)
+        self.assertEqual(active_count, 0)
+        self.assertEqual(events[0]["type"], "assistant")
+        self.assertEqual(events[-1]["type"], "error")
