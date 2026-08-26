@@ -1,0 +1,144 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1779680815854,
+  "projectRoot": "/Users/zagabi/Desktop/develop/claudecord",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": "snake_case",
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "examples",
+      "scripts",
+      "src",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 2,
+      "lastAccessed": 1779680815820,
+      "keyFiles": [
+        "claude_ping_result.json",
+        "stream_result_event.json"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 9,
+      "lastAccessed": 1779680815821,
+      "keyFiles": [
+        "check_claude.ps1",
+        "check_claude.sh",
+        "launchd_load.sh",
+        "register_scheduled_task.ps1",
+        "run_bot.ps1"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 9,
+      "lastAccessed": 1779680815830,
+      "keyFiles": [
+        "__init__.py",
+        "auth.py",
+        "greetings.py",
+        "main.py",
+        "orchestrator.py"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 6,
+      "lastAccessed": 1779680815831,
+      "keyFiles": [
+        "test_greetings.py",
+        "test_orchestrator.py",
+        "test_outputs.py",
+        "test_parser.py",
+        "test_runner.py"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/main.py",
+      "accessCount": 3,
+      "lastAccessed": 1779693246302,
+      "type": "file"
+    },
+    {
+      "path": "src/orchestrator.py",
+      "accessCount": 3,
+      "lastAccessed": 1779693389430,
+      "type": "file"
+    },
+    {
+      "path": "src/sessions.py",
+      "accessCount": 2,
+      "lastAccessed": 1779693388184,
+      "type": "file"
+    },
+    {
+      "path": ".env",
+      "accessCount": 2,
+      "lastAccessed": 1779693408697,
+      "type": "file"
+    },
+    {
+      "path": "src/runner.py",
+      "accessCount": 1,
+      "lastAccessed": 1779682167239,
+      "type": "file"
+    },
+    {
+      "path": "src/parser.py",
+      "accessCount": 1,
+      "lastAccessed": 1779682171771,
+      "type": "file"
+    },
+    {
+      "path": "commit.md",
+      "accessCount": 1,
+      "lastAccessed": 1779693893824,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}
