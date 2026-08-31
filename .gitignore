@@ -25,3 +25,7 @@ env/
 # one part meant to be committed.
 .omc/
 !.omc/skills/
+
+# Project tag config (issue #16) -- contains personal project paths/hints,
+# not meant for the public repo. See projects.example.toml.
+projects.toml

@@ -1,0 +1,24 @@
+# Example project tag configuration for claudecord.
+#
+# Copy this file to `projects.toml` in the repo root (git-ignored), or set
+# PROJECTS_FILE to point anywhere else, then edit the entries for your own
+# projects. If no file is present, the bot runs fine with no project tags.
+#
+# Each top-level table name becomes a "@name" tag in Discord messages.
+#   dir  (required) - directory name (or absolute path) for the project.
+#                      A relative name is resolved under PROJECT_ROOT; an
+#                      absolute path is used as-is, bypassing PROJECT_ROOT.
+#   hint (optional) - text appended as a system prompt hint
+#                      (--append-system-prompt) whenever this tag is used.
+
+[book]
+dir = "book"
+hint = "길벗 출판사용 클로드코드 책 원고. 한국어로 답변, 변경 시 diff 표시."
+
+[md2short]
+dir = "md2short"
+hint = "Remotion + ElevenLabs 비디오 파이프라인."
+
+[avisspick]
+dir = "avisspick"
+hint = "어비스픽 투자 리포트 서비스. 보안 정보 출력 금지."
