@@ -10,7 +10,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)]()
 [![Claude Code](https://img.shields.io/badge/Powered%20by-Claude%20Code-D97757)]()
-[![License](https://img.shields.io/badge/License-MIT-green.svg)]()
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 
 ---
 
