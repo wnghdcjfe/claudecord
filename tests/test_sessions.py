@@ -1,6 +1,8 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -309,3 +311,210 @@ class SessionsTests(unittest.TestCase):
 
             self.assertEqual(cleared, 2)
             self.assertEqual(store, {})
+
+    # --- Issue #27.3: an already-empty store must not be rewritten. ---
+
+    def test_clear_all_sessions_does_not_touch_disk_when_the_store_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                with mock.patch.object(Path, "write_text", autospec=True) as spy:
+                    self.assertEqual(sessions.clear_all_sessions(), 0)
+                spy.assert_not_called()
+
+            self.assertFalse(store_path.exists())
+
+    def test_repeated_clear_all_sessions_writes_only_the_first_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                sessions.set_session(123, "sess-1")
+                self.assertEqual(sessions.clear_all_sessions(), 1)
+
+                mtime_after_clear = store_path.stat().st_mtime_ns
+                with mock.patch.object(Path, "write_text", autospec=True) as spy:
+                    self.assertEqual(sessions.clear_all_sessions(), 0)
+                spy.assert_not_called()
+                self.assertEqual(store_path.stat().st_mtime_ns, mtime_after_clear)
+
+    # --- Issue #14.1: a corrupt store must not take the bot down. ---
+
+    def test_corrupt_store_is_backed_up_and_the_bot_keeps_working(self):
+        truncated = '{"123": {"session_id": "sess-1", "workd'
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+            store_path.write_text(truncated, encoding="utf-8")
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                # get_session_state sits on every incoming message; it used to
+                # raise JSONDecodeError here and keep raising forever.
+                with self.assertLogs("src.sessions", level="WARNING"):
+                    self.assertIsNone(sessions.get_session_state(123))
+
+                sessions.set_session(123, "sess-2", workdir="/tmp/project")
+                recovered = sessions.get_session_state(123)
+
+            self.assertEqual(recovered.session_id, "sess-2")
+
+            backup = store_path.with_name("sessions.json.corrupt")
+            self.assertEqual(backup.read_text(encoding="utf-8"), truncated)
+
+            store = json.loads(store_path.read_text(encoding="utf-8"))
+            self.assertEqual(store["123"]["session_id"], "sess-2")
+
+    def test_valid_json_that_is_not_an_object_is_treated_as_corrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+            store_path.write_text('["not", "a", "store"]', encoding="utf-8")
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                with self.assertLogs("src.sessions", level="WARNING"):
+                    self.assertIsNone(sessions.get_session_state(123))
+                sessions.set_session(123, "sess-1")
+                self.assertEqual(sessions.get_session_state(123).session_id, "sess-1")
+
+            self.assertTrue(store_path.with_name("sessions.json.corrupt").exists())
+
+    def test_a_corrupt_store_that_cannot_be_backed_up_still_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+            store_path.write_text("{oops", encoding="utf-8")
+
+            with (
+                mock.patch.object(sessions, "_STORE_PATH", store_path),
+                mock.patch.object(os, "replace", side_effect=OSError("read-only fs")),
+                self.assertLogs("src.sessions", level="WARNING"),
+            ):
+                self.assertIsNone(sessions.get_session_state(123))
+
+    # --- Issue #14.2a: writes must be atomic. ---
+
+    def test_saves_never_write_the_store_path_in_place(self):
+        original_write_text = Path.write_text
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                with mock.patch.object(Path, "write_text", autospec=True) as spy:
+                    spy.side_effect = lambda self, *a, **kw: original_write_text(self, *a, **kw)
+                    sessions.set_session(123, "sess-1")
+
+                written = [call.args[0] for call in spy.call_args_list]
+
+            self.assertTrue(written)
+            # Every byte goes to a temp sibling that os.replace then swaps in.
+            self.assertNotIn(store_path, written)
+            self.assertEqual(json.loads(store_path.read_text(encoding="utf-8"))["123"]["session_id"], "sess-1")
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["sessions.json"])
+
+    def test_a_write_that_dies_halfway_leaves_the_previous_store_intact(self):
+        original_write_text = Path.write_text
+
+        def half_written_then_crash(self, data, *args, **kwargs):
+            # Models the process dying mid-write: half the bytes land, the
+            # rest never do.
+            original_write_text(self, data[: len(data) // 2], *args, **kwargs)
+            raise OSError("no space left on device")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                sessions.set_session(123, "sess-1", workdir="/tmp/a")
+
+                with (
+                    mock.patch.object(
+                        Path, "write_text", autospec=True, side_effect=half_written_then_crash
+                    ),
+                    self.assertLogs("src.sessions", level="WARNING"),
+                ):
+                    sessions.set_session(456, "sess-2", workdir="/tmp/b")
+
+            store = json.loads(store_path.read_text(encoding="utf-8"))
+            self.assertEqual(store["123"]["session_id"], "sess-1")
+            self.assertNotIn("456", store)
+            # The half-written temp file is cleaned up rather than left to be
+            # mistaken for a store later.
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["sessions.json"])
+
+    # --- Issue #14.2b: concurrent writes must not lose sessions. ---
+
+    def test_concurrent_writes_do_not_lose_sessions(self):
+        channels = list(range(1, 9))
+        start = threading.Barrier(len(channels))
+        failures: list[BaseException] = []
+
+        def slow_now():
+            # Widens the read-modify-write window: set_session calls _now()
+            # after reading the store and before writing it back. Unserialized,
+            # all eight threads would read the same empty store and the last
+            # writer would win, silently dropping seven sessions.
+            time.sleep(0.005)
+            return datetime.now(UTC)
+
+        def worker(channel_id: int) -> None:
+            try:
+                start.wait(timeout=5)
+                sessions.set_session(channel_id, f"sess-{channel_id}", workdir=f"/tmp/{channel_id}")
+            # Anything at all: a thread that dies silently would let this test
+            # pass on a store that never got written. Re-raised on the main
+            # thread once every worker has joined.
+            except BaseException as exc:
+                failures.append(exc)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+
+            with (
+                mock.patch.object(sessions, "_STORE_PATH", store_path),
+                mock.patch.object(sessions, "_now", side_effect=slow_now),
+            ):
+                threads = [threading.Thread(target=worker, args=(c,)) for c in channels]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+
+                self.assertEqual(failures, [])
+                self.assertFalse([t for t in threads if t.is_alive()])
+
+                for channel_id in channels:
+                    state = sessions.get_session_state(channel_id)
+                    self.assertIsNotNone(state, f"channel {channel_id} lost its session")
+                    self.assertEqual(state.session_id, f"sess-{channel_id}")
+
+            on_disk = json.loads(store_path.read_text(encoding="utf-8"))
+            self.assertEqual(sorted(on_disk), sorted(str(c) for c in channels))
+
+    def test_concurrent_clears_and_writes_leave_the_store_readable(self):
+        # A clear racing a write may legitimately win or lose, but it must
+        # never leave a store that cannot be parsed back.
+        channels = list(range(1, 6))
+        failures: list[BaseException] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "sessions.json"
+
+            def writer(channel_id: int) -> None:
+                try:
+                    for _ in range(20):
+                        sessions.set_session(channel_id, f"sess-{channel_id}")
+                        sessions.clear_session(channel_id)
+                # Same reason as above: collected here, re-raised on the main
+                # thread so a worker failure cannot pass as success.
+                except BaseException as exc:
+                    failures.append(exc)
+
+            with mock.patch.object(sessions, "_STORE_PATH", store_path):
+                threads = [threading.Thread(target=writer, args=(c,)) for c in channels]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+
+            self.assertEqual(failures, [])
+            self.assertEqual(json.loads(store_path.read_text(encoding="utf-8")), {})
