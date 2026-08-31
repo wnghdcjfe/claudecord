@@ -521,6 +521,74 @@ class OutputTests(unittest.TestCase):
         self.assertFalse(any(message["files"] for message in sent))
         self.assertTrue(any("무시" in (message["content"] or "") for message in sent))
 
+    def test_send_outputs_rejects_absolute_meta_json_path_without_leaking_it(self):
+        # Issue #26: entry.get("path") is echoed back in the "무시했습니다"
+        # notice. When the rejected path was itself a real local absolute
+        # path (as here), that echo must not leak it.
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                job_dir = Path(tmp) / "job-secret-path"
+                job_dir.mkdir()
+                outside = Path(tmp) / "outside-secret.txt"
+                outside.write_text("outside", encoding="utf-8")
+                (job_dir / "meta.json").write_text(
+                    json.dumps({"files": [{"path": str(outside), "label": "abs"}]}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                channel = FakeChannel()
+                await send_outputs(channel, job_dir, body_text="본문")
+                return channel.sent, str(outside)
+
+        sent, outside_path = asyncio.run(scenario())
+        contents = [message["content"] or "" for message in sent]
+        ignored_message = next(c for c in contents if "무시" in c)
+        self.assertNotIn(outside_path, ignored_message)
+
+    # --- Issue #27 (item 1): the over-limit message must be derived from
+    # MAX_ATTACH_BYTES, not a hardcoded "25MB" that can drift from it. ---
+
+    def test_send_outputs_attachment_over_limit_message_derives_from_constant(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                job_dir = Path(tmp)
+                (job_dir / "big.bin").write_bytes(b"x" * (4 * 1024 * 1024))
+                (job_dir / "manifest.json").write_text(
+                    json.dumps({"files": [{"path": "big.bin", "label": "big"}]}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                channel = FakeChannel()
+                with mock.patch.object(outputs, "MAX_ATTACH_BYTES", 3 * 1024 * 1024):
+                    await send_outputs(channel, job_dir)
+                return channel.sent
+
+        sent = asyncio.run(scenario())
+        contents = [message["content"] or "" for message in sent]
+        self.assertTrue(any("3MB를 초과" in c for c in contents))
+        self.assertFalse(any("25MB" in c for c in contents))
+
+    # --- Issue #26: the over-limit notice also echoes the attachment's
+    # absolute path; it must go out redacted. ---
+
+    def test_send_outputs_attachment_over_limit_message_does_not_leak_absolute_path(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                job_dir = Path(tmp) / "job-secret-path"
+                job_dir.mkdir()
+                (job_dir / "big.bin").write_bytes(b"x" * (4 * 1024 * 1024))
+                (job_dir / "manifest.json").write_text(
+                    json.dumps({"files": [{"path": "big.bin", "label": "big"}]}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                channel = FakeChannel()
+                with mock.patch.object(outputs, "MAX_ATTACH_BYTES", 3 * 1024 * 1024):
+                    await send_outputs(channel, job_dir)
+                return channel.sent, str(job_dir)
+
+        sent, job_path = asyncio.run(scenario())
+        contents = [message["content"] or "" for message in sent]
+        over_limit_message = next(c for c in contents if "초과" in c)
+        self.assertNotIn(job_path, over_limit_message)
+        self.assertIn("big.bin", over_limit_message)
 
     # --- Issue #4: long-answer delivery must not tail-latency behind
     # Discord's per-channel rate limit. ---
@@ -615,6 +683,92 @@ class OutputTests(unittest.TestCase):
         chunks = outputs._chunk(text, 500)
         self.assertTrue(all(len(chunk) <= 500 for chunk in chunks))
         self.assertEqual("".join(chunks), text)
+
+
+class SvgRendererFallbackTests(unittest.TestCase):
+    # --- Issue #20: qlmanage-only preview rendering leaves Linux/Windows
+    # hosts with no inline PNG preview, ever. _render_svg_preview must try
+    # the fallback chain in order and stop at the first success. ---
+
+    def _write_svg(self, job_dir: Path) -> Path:
+        svg_path = job_dir / "art.svg"
+        svg_path.write_text(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"10\" height=\"10\"></svg>\n",
+            encoding="utf-8",
+        )
+        return svg_path
+
+    def test_falls_back_through_renderers_in_order_and_stops_at_first_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            svg_path = self._write_svg(job_dir)
+
+            which_calls = []
+
+            def fake_which(name):
+                which_calls.append(name)
+                # Only rsvg-convert is "installed" in this scenario.
+                return "/usr/bin/rsvg-convert" if name == "rsvg-convert" else None
+
+            run_calls = []
+
+            def fake_run(args, **kwargs):
+                run_calls.append(args)
+                # rsvg-convert's invocation is [exe, -w, size, -o, preview, svg]
+                preview_path = Path(args[-2])
+                preview_path.write_bytes(b"png")
+                return subprocess.CompletedProcess(args, 0)
+
+            with mock.patch("src.outputs.shutil.which", fake_which), \
+                    mock.patch("src.outputs.subprocess.run", fake_run):
+                result = outputs._render_svg_preview(svg_path)
+
+            self.assertEqual(result, job_dir / ".discord-previews" / "art.svg.png")
+            # qlmanage was probed (and skipped, not installed); inkscape and
+            # cairosvg were never even probed once rsvg-convert succeeded.
+            self.assertEqual(which_calls, ["qlmanage", "rsvg-convert"])
+            self.assertEqual(len(run_calls), 1)
+            self.assertIn("rsvg-convert", run_calls[0][0])
+
+    def test_uses_cairosvg_when_no_cli_renderer_is_installed(self):
+        # cairosvg must work as a graceful, optional-import fallback — never
+        # a hard dependency (see the team-lead brief for #20).
+        import types
+
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            svg_path = self._write_svg(job_dir)
+
+            calls = []
+            fake_cairosvg = types.ModuleType("cairosvg")
+
+            def fake_svg2png(url, write_to, output_width=None):
+                calls.append((url, write_to))
+                Path(write_to).write_bytes(b"png")
+
+            fake_cairosvg.svg2png = fake_svg2png
+
+            with mock.patch("src.outputs.shutil.which", return_value=None), \
+                    mock.patch.dict("sys.modules", {"cairosvg": fake_cairosvg}):
+                result = outputs._render_svg_preview(svg_path)
+
+            self.assertEqual(result, job_dir / ".discord-previews" / "art.svg.png")
+            self.assertEqual(len(calls), 1)
+
+    def test_returns_none_and_logs_when_no_renderer_is_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            svg_path = self._write_svg(job_dir)
+
+            # Force the optional cairosvg import to fail regardless of
+            # whether the real package happens to be installed in this env.
+            with mock.patch("src.outputs.shutil.which", return_value=None), \
+                    mock.patch.dict("sys.modules", {"cairosvg": None}), \
+                    self.assertLogs("src.outputs", level="WARNING") as logs:
+                result = outputs._render_svg_preview(svg_path)
+
+            self.assertIsNone(result)
+            self.assertTrue(any("art.svg" in message for message in logs.output))
 
 
 class AttachmentPathsForTests(unittest.TestCase):

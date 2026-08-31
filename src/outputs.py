@@ -6,10 +6,13 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import discord
+
+from src.errors import redact_paths
 
 logger = logging.getLogger(__name__)
 
@@ -288,7 +291,10 @@ async def _send_attachment_entries(channel: discord.abc.Messageable, job_dir: Pa
 
         p = _safe_manifest_path(job_dir, entry.get("path"))
         if p is None:
-            await channel.send(f"manifest 경로를 무시했습니다: {entry.get('path')}")
+            # entry.get("path") is job-controlled text and, for an absolute
+            # or traversal attempt, may itself be a real local path (#26) --
+            # redact before it reaches Discord.
+            await channel.send(f"manifest 경로를 무시했습니다: {redact_paths(str(entry.get('path')))}")
             continue
         if not p.exists():
             continue
@@ -301,7 +307,13 @@ async def _send_attachment_entries(channel: discord.abc.Messageable, job_dir: Pa
 
             if attach_path.stat().st_size > MAX_ATTACH_BYTES:
                 label = entry.get("label") or attach_path.name
-                await channel.send(f"파일 {label}이 25MB를 초과해 첨부 불가. 경로: {attach_path}")
+                # Derived from MAX_ATTACH_BYTES so this text can never drift
+                # from the actual limit again (#27); the path is redacted
+                # since it's a real local absolute path (#26).
+                limit_mb = MAX_ATTACH_BYTES // (1024 * 1024)
+                await channel.send(
+                    f"파일 {label}이 {limit_mb}MB를 초과해 첨부 불가. 경로: {redact_paths(str(attach_path))}"
+                )
                 continue
 
             # discord.File(path) opens the file synchronously in its
@@ -323,8 +335,10 @@ async def _send_attachment_entries(channel: discord.abc.Messageable, job_dir: Pa
 async def _attachment_paths_for(path: Path) -> list[Path]:
     suffix = path.suffix.lower()
     if suffix == SVG_EXTENSION:
-        # qlmanage is a slow, blocking subprocess call — run it off the event
-        # loop thread so a single SVG preview doesn't stall the whole bot.
+        # SVG preview rendering shells out to an external tool (or the
+        # optional cairosvg package) and can block for a while — run it off
+        # the event loop thread so a single SVG preview doesn't stall the
+        # whole bot.
         preview = await asyncio.to_thread(_render_svg_preview, path)
         return [p for p in [preview, path] if p is not None]
     if suffix in IMAGE_EXTENSIONS:
@@ -332,12 +346,103 @@ async def _attachment_paths_for(path: Path) -> list[Path]:
     return [path]
 
 
-def _render_svg_preview(svg_path: Path) -> Path | None:
-    """Blocking. Must only be invoked via asyncio.to_thread (see _attachment_paths_for)."""
-    qlmanage = shutil.which("qlmanage")
-    if not qlmanage:
-        return None
+def _run_qlmanage(svg_path: Path, preview_path: Path) -> bool:
+    """macOS Quick Look thumbnailer. Writes ``<svg name>.png`` into the
+    output dir, which is exactly how ``preview_path`` is named below."""
+    exe = shutil.which("qlmanage")
+    if not exe:
+        return False
+    try:
+        result = subprocess.run(
+            [exe, "-t", "-s", str(SVG_PREVIEW_SIZE), "-o", str(preview_path.parent), str(svg_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and preview_path.exists()
 
+
+def _run_rsvg_convert(svg_path: Path, preview_path: Path) -> bool:
+    """librsvg's CLI converter — common on Linux, unlike qlmanage (#20)."""
+    exe = shutil.which("rsvg-convert")
+    if not exe:
+        return False
+    try:
+        result = subprocess.run(
+            [exe, "-w", str(SVG_PREVIEW_SIZE), "-o", str(preview_path), str(svg_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and preview_path.exists()
+
+
+def _run_inkscape(svg_path: Path, preview_path: Path) -> bool:
+    """Inkscape's CLI export — heavier than rsvg-convert but widely
+    available cross-platform, including Windows, when installed (#20)."""
+    exe = shutil.which("inkscape")
+    if not exe:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                exe,
+                "--export-type=png",
+                f"--export-filename={preview_path}",
+                "-w",
+                str(SVG_PREVIEW_SIZE),
+                str(svg_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and preview_path.exists()
+
+
+def _run_cairosvg(svg_path: Path, preview_path: Path) -> bool:
+    """Pure-Python last resort for hosts with no rendering CLI on PATH at
+    all. Imported lazily and optionally — cairosvg must not become a hard
+    runtime dependency just to send Discord messages (#20)."""
+    try:
+        import cairosvg
+    except ImportError:
+        return False
+    try:
+        cairosvg.svg2png(url=str(svg_path), write_to=str(preview_path), output_width=SVG_PREVIEW_SIZE)
+    except Exception:
+        # cairosvg surfaces a mix of its own errors and lxml/cairo errors for
+        # malformed input; any of them just means "this renderer can't do it."
+        logger.debug("cairosvg failed to render %s", svg_path.name, exc_info=True)
+        return False
+    return preview_path.exists()
+
+
+# Tried in this order; the first renderer that produces preview_path wins.
+# qlmanage stays first since it needs no install on the platform this bot
+# was originally built for; the rest cover Linux/Windows hosts (#20).
+_SVG_RENDERERS: list[tuple[str, Callable[[Path, Path], bool]]] = [
+    ("qlmanage", _run_qlmanage),
+    ("rsvg-convert", _run_rsvg_convert),
+    ("inkscape", _run_inkscape),
+    ("cairosvg", _run_cairosvg),
+]
+
+
+def _render_svg_preview(svg_path: Path) -> Path | None:
+    """Blocking. Must only be invoked via asyncio.to_thread (see
+    _attachment_paths_for). Tries each candidate in _SVG_RENDERERS in turn
+    and returns the first PNG produced.
+    """
     preview_dir = svg_path.parent / ".discord-previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
     preview_path = preview_dir / f"{svg_path.name}.png"
@@ -345,20 +450,24 @@ def _render_svg_preview(svg_path: Path) -> Path | None:
         return preview_path
 
     preview_path.unlink(missing_ok=True)
-    try:
-        result = subprocess.run(
-            [qlmanage, "-t", "-s", str(SVG_PREVIEW_SIZE), "-o", str(preview_dir), str(svg_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=20,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
 
-    if result.returncode != 0 or not preview_path.exists():
-        return None
-    return preview_path
+    for name, renderer in _SVG_RENDERERS:
+        try:
+            if renderer(svg_path, preview_path):
+                return preview_path
+        except Exception:
+            logger.debug("SVG renderer %s raised while converting %s", name, svg_path.name, exc_info=True)
+
+    # Previously this failed silently (#25) — no PNG and no explanation.
+    # Attaching the raw .svg alone is still correct behavior when nothing is
+    # installed, but the operator should be able to tell why from the log.
+    logger.warning(
+        "No SVG-to-PNG renderer available for %s (tried: %s); attaching the raw .svg only. "
+        "Install qlmanage (macOS)/rsvg-convert/inkscape, or `pip install cairosvg`, for inline previews.",
+        svg_path.name,
+        ", ".join(name for name, _ in _SVG_RENDERERS),
+    )
+    return None
 
 
 def _effective_inline_max_chunks() -> int:
