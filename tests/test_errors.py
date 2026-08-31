@@ -133,6 +133,7 @@ class SafeErrorTextTests(unittest.TestCase):
         try:
             Path(f"{FAKE_HOME}/no-such-dir/missing.txt").read_text(encoding="utf-8")
         except OSError as exc:
+            raw = str(exc)
             rendered = safe_error_text(exc)
         else:  # pragma: no cover - the path is guaranteed absent
             self.fail("expected the open() to fail")
@@ -140,7 +141,11 @@ class SafeErrorTextTests(unittest.TestCase):
         self.assertTrue(rendered.startswith("FileNotFoundError:"))
         self.assertNotIn("testuser", rendered)
         self.assertNotIn(FAKE_HOME, rendered)
-        self.assertIn("~/no-such-dir/missing.txt", rendered)
+        # The tail comes from the exception's own text, not from the literal
+        # typed above: str(OSError) renders the filename with repr(), so on
+        # Windows the same path arrives as `\\Users\\testuser\\...` -- flipped
+        # separators, and doubled by the escaping.
+        self.assertIn("~" + raw.split("testuser", 1)[1], rendered)
 
     def test_an_exception_with_no_message_renders_as_the_bare_type_name(self):
         self.assertEqual(safe_error_text(TimeoutError()), "TimeoutError")

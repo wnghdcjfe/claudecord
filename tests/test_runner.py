@@ -1,8 +1,10 @@
 import asyncio
+import ctypes
 import gc
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,6 +33,13 @@ from src.timing import SPAN_FIRST_EVENT, SPAN_SPAWN, JobTimings
 # oversized stdout line after a normal one).
 FAKE_CLI = r'''#!/usr/bin/env python3
 import json, os, sys, time
+
+# The runner writes each user turn as UTF-8 (warm_pool.send_user_message) and
+# decodes stdout as UTF-8. Python only assumes that for a pipe where UTF-8 is
+# the locale encoding, which on Windows it is not -- a Korean prompt would
+# arrive as cp1252 and blow up on the first byte that page leaves undefined.
+sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+sys.stdout.reconfigure(encoding="utf-8")
 
 argv = sys.argv[1:]
 stream_input = "--input-format" in argv
@@ -114,7 +123,39 @@ sys.exit(0)
 '''
 
 
+def _scratch() -> tempfile.TemporaryDirectory:
+    """A temp directory that tolerates a claude process still living in it.
+
+    Several tests below deliberately leave a warm process parked and alive when
+    the block exits -- that is the behaviour under test, and ``_run`` drains the
+    pool afterwards, inside the event loop that owns the transports. POSIX
+    unlinks a directory out from under a running process happily. Windows does
+    not: a live process pins its own cwd and the script file it is executing,
+    both of which are in here, so the cleanup raises PermissionError and the
+    test fails on teardown having proved its point. Leave those few directories
+    to the OS's temp sweeper rather than reordering every test around it.
+    """
+    return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # os.kill() is not a liveness probe on Windows: every signal except
+        # CTRL_C_EVENT/CTRL_BREAK_EVENT goes straight to TerminateProcess, so
+        # the POSIX `os.kill(pid, 0)` idiom would *kill* the process this is
+        # asking about -- and the tests below ask about processes they then
+        # expect to still be running. Open a handle and ask instead.
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return False
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -122,9 +163,30 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _install_fake_cli(tmp: str) -> Path:
-    script = Path(tmp) / "claude"
-    script.write_text(FAKE_CLI, encoding="utf-8")
+def _install_fake_cli(tmp: str, body: str = FAKE_CLI) -> Path:
+    """Put a fake claude CLI on PATH where _resolve_claude_executable finds it.
+
+    POSIX gets the script itself, named `claude` and marked executable; the
+    shebang does the rest. Windows has neither -- CreateProcess will not run a
+    .py file and ignores shebangs -- so it gets the shape the real CLI has
+    there: a `claude.cmd` batch shim (which is exactly what npm installs)
+    handing the script to this interpreter, which runner.py then runs through
+    COMSPEC. `@echo off` is load-bearing: a batch file echoes every line it
+    runs to stdout, and stdout is the event stream.
+    """
+    directory = Path(tmp)
+    if os.name == "nt":
+        script = directory / "claude_fake.py"
+        script.write_text(body, encoding="utf-8")
+        shim = directory / "claude.cmd"
+        shim.write_text(
+            f'@echo off\r\n"{sys.executable}" "{script}" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="utf-8",
+        )
+        return shim
+
+    script = directory / "claude"
+    script.write_text(body, encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return script
 
@@ -264,18 +326,16 @@ class RunnerTests(unittest.TestCase):
 
     def test_run_claude_stream_returns_json_and_error_event_on_nonzero_exit(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
-                script = Path(tmp) / "claude"
-                script.write_text(
+            with _scratch() as tmp:
+                _install_fake_cli(
+                    tmp,
                     "#!/usr/bin/env python3\n"
                     "import sys\n"
                     "print('{\"type\": \"assistant\", \"message\": {\"content\": []}}')\n"
                     "print('not-json')\n"
                     "sys.stderr.write('boom')\n"
                     "sys.exit(7)\n",
-                    encoding="utf-8",
                 )
-                script.chmod(script.stat().st_mode | stat.S_IXUSR)
                 with mock.patch.dict(os.environ, {"PATH": tmp + os.pathsep + os.environ.get("PATH", "")}, clear=False):
                     events = [event async for event in run_claude_stream("hello", workdir=tmp)]
 
@@ -335,18 +395,16 @@ class RunnerTests(unittest.TestCase):
         # "ValueError: Separator is not found, and chunk exceed the limit"
         # unless create_subprocess_exec is given a bigger `limit=`.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
-                script = Path(tmp) / "claude"
-                script.write_text(
+            with _scratch() as tmp:
+                _install_fake_cli(
+                    tmp,
                     "#!/usr/bin/env python3\n"
                     "import json\n"
                     "payload = 'x' * 200000\n"
                     "print(json.dumps({'type': 'assistant', 'message': "
                     "{'content': [{'type': 'text', 'text': payload}]}}))\n"
                     "print(json.dumps({'type': 'result'}))\n",
-                    encoding="utf-8",
                 )
-                script.chmod(script.stat().st_mode | stat.S_IXUSR)
                 with mock.patch.dict(
                     os.environ,
                     {"PATH": tmp + os.pathsep + os.environ.get("PATH", "")},
@@ -368,10 +426,10 @@ class RunnerTests(unittest.TestCase):
         # exception escape, and (b) actually terminate the process instead of
         # leaking it as an untracked orphan.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 pid_file = Path(tmp) / "pid.txt"
-                script = Path(tmp) / "claude"
-                script.write_text(
+                _install_fake_cli(
+                    tmp,
                     "#!/usr/bin/env python3\n"
                     "import json, os, time\n"
                     f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
@@ -379,9 +437,7 @@ class RunnerTests(unittest.TestCase):
                     "print(json.dumps({'type': 'assistant', 'message': "
                     "{'content': [{'type': 'text', 'text': payload}]}}), flush=True)\n"
                     "time.sleep(30)\n",
-                    encoding="utf-8",
                 )
-                script.chmod(script.stat().st_mode | stat.S_IXUSR)
                 with mock.patch.dict(
                     os.environ,
                     {
@@ -402,21 +458,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "error")
         self.assertIn("리밋", events[-1]["text"])
         self.assertEqual(get_active_claude_process_count(), 0)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        # Not `os.kill(pid, 0)`: that idiom terminates the process on Windows
+        # rather than probing it. See _pid_alive.
+        self.assertFalse(_pid_alive(pid), "the runaway process must be reaped")
 
     def test_active_claude_processes_can_be_terminated(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
-                script = Path(tmp) / "claude"
-                script.write_text(
+            with _scratch() as tmp:
+                _install_fake_cli(
+                    tmp,
                     "#!/usr/bin/env python3\n"
                     "import json, sys, time\n"
                     "print(json.dumps({'type': 'assistant'}), flush=True)\n"
                     "time.sleep(30)\n",
-                    encoding="utf-8",
                 )
-                script.chmod(script.stat().st_mode | stat.S_IXUSR)
                 events = []
 
                 async def collect_events():
@@ -491,7 +546,7 @@ class RunnerTests(unittest.TestCase):
         # warm one -- a job that fell back to a cold spawn still has to be
         # reapable without touching anybody else's process.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 scope = JobProcessScope()
                 events = []
@@ -641,7 +696,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_second_turn_reuses_the_process_instead_of_spawning(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(os.environ, self._env(tmp), clear=False):
                     first = await self._collect("첫 질문", workdir=tmp)
@@ -660,7 +715,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_a_new_conversation_never_inherits_a_parked_process(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(os.environ, self._env(tmp), clear=False):
                     await self._collect("첫 질문", workdir=tmp)
@@ -675,7 +730,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_a_different_workdir_never_reuses_a_process(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            with _scratch() as tmp, _scratch() as other:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(os.environ, self._env(tmp), clear=False):
                     first = await self._collect("첫 질문", workdir=tmp)
@@ -695,7 +750,7 @@ class WarmRunnerTests(unittest.TestCase):
         self.assertTrue(runner.WARM_KEY_IGNORES_EXTRA_DIRS)
 
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(os.environ, self._env(tmp), clear=False):
                     first = await self._collect("첫 질문", workdir=tmp, extra_dirs=[tmp + "/job-1"])
@@ -712,7 +767,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_warm_disabled_falls_back_to_the_cold_path_entirely(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(
                     os.environ, self._env(tmp, WARM_CLAUDE="0"), clear=False
@@ -731,7 +786,7 @@ class WarmRunnerTests(unittest.TestCase):
         # The safety requirement: if streaming-input mode is broken for any
         # reason, the user must still get their answer from a cold spawn.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(
                     os.environ, self._env(tmp, FAKE_STREAM_BROKEN="1"), clear=False
@@ -764,7 +819,7 @@ class WarmRunnerTests(unittest.TestCase):
     def test_shutdown_drains_parked_warm_processes(self):
         # Issue #2's completion criterion: 종료 must clear the warm pool.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 pid_file = Path(tmp) / "pid.txt"
                 with mock.patch.dict(
@@ -788,8 +843,10 @@ class WarmRunnerTests(unittest.TestCase):
         self.assertEqual(summary.terminated, 1)
         self.assertEqual(get_active_claude_process_count(), 0)
         self.assertEqual(len(get_warm_pool()), 0)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        # Not `os.kill(pid, 0)`: that idiom terminates the process on Windows
+        # rather than probing it, and reports a dead pid as WinError 87 rather
+        # than ProcessLookupError. See _pid_alive.
+        self.assertFalse(_pid_alive(pid), "종료 must reap the parked process")
 
     def test_warm_processes_join_the_shared_active_process_set(self):
         # Cross-worker contract: warm processes are tracked in the very same
@@ -799,10 +856,13 @@ class WarmRunnerTests(unittest.TestCase):
         # timeout test registers a process into this set directly and asserts
         # on that count, so neither the name nor the element type may change.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 external = await asyncio.create_subprocess_exec(
-                    "/bin/sh", "-c", "sleep 60",
+                    # This interpreter rather than /bin/sh: the process only has
+                    # to exist and outlive the test, and Windows has no shell at
+                    # that path. Same stand-in tests/test_main.py uses.
+                    sys.executable, "-c", "import time; time.sleep(60)",
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
@@ -836,7 +896,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_a_terminated_warm_process_is_never_handed_to_a_later_turn(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(os.environ, self._env(tmp), clear=False):
                     first = await self._collect("첫 질문", workdir=tmp)
@@ -852,7 +912,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_terminating_mid_turn_surfaces_an_error_and_reaps_the_process(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 events = []
 
@@ -884,7 +944,7 @@ class WarmRunnerTests(unittest.TestCase):
         # The cold path's LimitOverrunError/ValueError defence must hold on the
         # warm path too, including killing the process it stopped reading from.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 pid_file = Path(tmp) / "pid.txt"
                 with mock.patch.dict(
@@ -906,12 +966,13 @@ class WarmRunnerTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "error")
         self.assertIn("리밋", events[-1]["text"])
         self.assertEqual(get_active_claude_process_count(), 0)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(pid, 0)
+        # Not `os.kill(pid, 0)`: that idiom terminates the process on Windows
+        # rather than probing it. See _pid_alive.
+        self.assertFalse(_pid_alive(pid), "the runaway process must be reaped")
 
     def test_idle_warm_process_is_retired_after_the_ttl(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(
                     os.environ,
@@ -938,7 +999,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_pool_capacity_caps_the_number_of_live_warm_processes(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(
                     os.environ,
@@ -966,7 +1027,7 @@ class WarmRunnerTests(unittest.TestCase):
         marker = "No conversation found with session ID"
 
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(
                     os.environ, self._env(tmp, FAKE_STALE_RESUME="1"), clear=False
@@ -994,7 +1055,7 @@ class WarmRunnerTests(unittest.TestCase):
         # must leave job B's process alive and still usable, which is exactly
         # what swapping the terminate call for an AsyncMock would not prove.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 pid_a = Path(tmp) / "pid-a.txt"
                 pid_b = Path(tmp) / "pid-b.txt"
@@ -1054,7 +1115,7 @@ class WarmRunnerTests(unittest.TestCase):
         # job started must not survive into the next turn once we have decided
         # to kill the job -- the next turn would be handed a corpse.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 parked_pid = Path(tmp) / "parked.txt"
                 hung_pid = Path(tmp) / "hung.txt"
@@ -1123,7 +1184,7 @@ class WarmRunnerTests(unittest.TestCase):
         # dispose of P1, or turn 3, keyed back to A, is handed P1 and the user
         # watches the bot forget turn 2.
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            with _scratch() as tmp, _scratch() as other:
                 _install_fake_cli(tmp)
                 first_pid = Path(tmp) / "first.txt"
                 with mock.patch.dict(
@@ -1161,7 +1222,7 @@ class WarmRunnerTests(unittest.TestCase):
         marker = "No conversation found with session ID"
 
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 pid_file = Path(tmp) / "pid.txt"
                 with mock.patch.dict(
@@ -1190,7 +1251,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_an_errored_turn_is_never_parked_for_reuse(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(
                     os.environ, self._env(tmp, FAKE_STALE_RESUME="1"), clear=False
@@ -1207,7 +1268,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_timings_record_spawn_and_first_event_and_mark_cold_then_warm(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 cold = JobTimings("job-cold")
                 warm = JobTimings("job-warm")
@@ -1229,7 +1290,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_cold_path_timings_are_recorded_when_warm_is_disabled(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 timings = JobTimings("job-1")
                 with mock.patch.dict(
@@ -1246,7 +1307,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_timings_is_optional_so_existing_callers_keep_working(self):
         async def scenario():
-            with tempfile.TemporaryDirectory() as tmp:
+            with _scratch() as tmp:
                 _install_fake_cli(tmp)
                 with mock.patch.dict(os.environ, self._env(tmp), clear=False):
                     # Positional call in the pre-#7 argument order.

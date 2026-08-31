@@ -105,7 +105,10 @@ def test_project_root_applies_to_relative_dir_from_config(tmp_path, monkeypatch)
 def test_absolute_dir_in_config_bypasses_project_root(tmp_path, monkeypatch):
     absolute_dir = tmp_path / "elsewhere" / "book"
     config = tmp_path / "projects.toml"
-    config.write_text(f'[book]\ndir = "{absolute_dir}"\n', encoding="utf-8")
+    # A TOML *literal* string (single quotes): a Windows tmp path is full of
+    # backslashes, and a basic string would read `\U` in `C:\Users\...` as a
+    # unicode escape and fail to parse the whole file.
+    config.write_text(f"[book]\ndir = '{absolute_dir}'\n", encoding="utf-8")
     monkeypatch.setenv("PROJECTS_FILE", str(config))
     monkeypatch.setenv("PROJECT_ROOT", str(tmp_path / "root"))
 
