@@ -10,6 +10,10 @@ from unittest import mock
 
 from src import sessions
 
+# A stand-in for whatever a user configures in projects.toml. Kept generic so
+# the repo carries no one's real project names (issue #16).
+SAMPLE_PROJECT_HINT = "샘플 프로젝트. 보안 정보 출력 금지."
+
 
 class SessionsTests(unittest.TestCase):
     def setUp(self):
@@ -191,13 +195,13 @@ class SessionsTests(unittest.TestCase):
                 sessions.set_session(
                     123,
                     "sess-1",
-                    workdir="/tmp/avisspick",
-                    system_hint="어비스픽 투자 리포트 서비스. 보안 정보 출력 금지.",
+                    workdir="/tmp/sample",
+                    system_hint=SAMPLE_PROJECT_HINT,
                 )
                 state = sessions.get_session_state(123)
 
-            self.assertEqual(state.system_hint, "어비스픽 투자 리포트 서비스. 보안 정보 출력 금지.")
-            self.assertEqual(state.workdir, "/tmp/avisspick")
+            self.assertEqual(state.system_hint, SAMPLE_PROJECT_HINT)
+            self.assertEqual(state.workdir, "/tmp/sample")
 
     def test_set_session_without_a_hint_stores_none(self):
         with tempfile.TemporaryDirectory() as tmp:

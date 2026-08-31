@@ -636,7 +636,14 @@ def main():
     # Issue #9: bad or missing auth config must stop the bot here, with a
     # Korean message, rather than silently rejecting every message later.
     ensure_configured()
-    client.run(os.environ["DISCORD_BOT_TOKEN"])
+    # Same contract as ensure_configured(): a missing token is a configuration
+    # error the operator should read, not a KeyError traceback. ensure_configured
+    # does not cover it because auth.py is about who may talk to the bot, not
+    # about the bot's own credential.
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("환경변수 DISCORD_BOT_TOKEN이 필요합니다.")
+    client.run(token)
 
 
 if __name__ == "__main__":

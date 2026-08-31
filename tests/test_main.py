@@ -2016,6 +2016,44 @@ class StartupWiringTests(unittest.TestCase):
         # It stopped *before* connecting, which is the point.
         run.assert_not_called()
 
+    def test_a_missing_bot_token_stops_startup_with_a_korean_message(self):
+        # ensure_configured() covers who may talk to the bot, not the bot's own
+        # credential, so without this check a missing token surfaced as a bare
+        # KeyError traceback while every other config error got a sentence.
+        auth._config.cache_clear()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"OWNER_DISCORD_ID": "1", "ALLOWED_CHANNEL_IDS": "2"},
+                clear=True,
+            ),
+            mock.patch.object(main.client, "run") as run,
+            mock.patch.object(main, "_configure_logging"),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            main.main()
+
+        self.assertIn("DISCORD_BOT_TOKEN", str(caught.exception))
+        self.assertIn("환경변수", str(caught.exception))
+        run.assert_not_called()
+
+    def test_an_empty_bot_token_is_treated_as_missing(self):
+        auth._config.cache_clear()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"OWNER_DISCORD_ID": "1", "ALLOWED_CHANNEL_IDS": "2", "DISCORD_BOT_TOKEN": ""},
+                clear=True,
+            ),
+            mock.patch.object(main.client, "run") as run,
+            mock.patch.object(main, "_configure_logging"),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            main.main()
+
+        self.assertIn("DISCORD_BOT_TOKEN", str(caught.exception))
+        run.assert_not_called()
+
     def test_a_malformed_owner_id_also_stops_startup(self):
         auth._config.cache_clear()
         with (

@@ -12,7 +12,7 @@
 |------|-------------|
 | `main.py` | Discord 이벤트 진입점. `on_message`가 인증 → `/clear`·`종료`·인사 특수명령 처리 → 파싱 → 잡 생성 → 로더 스피너 → 실행 → 산출물 전송 순서를 조율. 만료된 세션에 대한 자동 재시도(`_run_job_with_session_recovery`) 포함 |
 | `auth.py` | 화이트리스트 인증. `OWNER_DISCORD_ID` 단일 소유자 + `ALLOWED_CHANNEL_IDS` 채널 목록. **모듈 import 시점에 환경변수를 읽고 검증한다** |
-| `parser.py` | 메시지 → `Command(prompt, session_id, workdir, system_hint)` 변환. `@sess-<id>` 접두사로 명시적 세션 지정, `@book`/`@md2short`/`@avisspick` 태그로 프로젝트 디렉터리 전환 |
+| `parser.py` | 메시지 → `Command(prompt, session_id, workdir, system_hint)` 변환. `@sess-<id>` 접두사로 명시적 세션 지정, `PROJECTS_FILE`(기본 `projects.toml`)에 정의된 `@<태그>`로 프로젝트 디렉터리 전환. 설정 파일이 없으면 태그 없이 동작한다 |
 | `orchestrator.py` | 잡 수명주기. `create_job`이 `runs/job-xxxx/`에 프롬프트·메타데이터를 쓰고, `run_job`이 스트림 이벤트를 `logs/stream.jsonl`에 적재하며 최종 result/error 이벤트를 반환. 다음 턴의 작업 디렉터리를 `session_state.json`에서 읽어 이어붙임 |
 | `runner.py` | Claude CLI 서브프로세스 계층. 명령줄 조립(`build_claude_command`), 스트리밍 실행(`run_claude_stream`), 실행 중 프로세스 추적 및 원격 일괄 종료(`terminate_active_claude_processes`). Windows 배치 래핑과 POSIX 프로세스 그룹 시그널 처리 포함 |
 | `sessions.py` | 채널별 Claude 세션 ID·작업 디렉터리 영속화. `~/.claudecord/sessions.json`에 JSON으로 저장, TTL 1시간 |
