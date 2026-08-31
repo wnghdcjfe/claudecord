@@ -18,3 +18,16 @@ discord-claude-assistant = "src.main:main"
 
 [tool.setuptools.packages.find]
 include = ["src*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+# Without `pythonpath`, `import src.*` fails for every test file: the repo has
+# no src-layout install step in the test path, so the root has to be on
+# sys.path explicitly.
+pythonpath = ["."]
+testpaths = ["tests"]

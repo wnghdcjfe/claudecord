@@ -18,3 +18,10 @@ env/
 # Env
 .env
 .env.local
+
+# oh-my-claudecode runtime state.
+# Session files record work history and local absolute paths, which do not
+# belong in a public repo. Project-scoped skills under .omc/skills/ are the
+# one part meant to be committed.
+.omc/
+!.omc/skills/

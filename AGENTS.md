@@ -13,7 +13,6 @@ Discord 봇으로 로컬 PC의 Claude Code CLI를 원격 조종하는 파이썬 
 | `.env.example` | 필수 환경변수 템플릿 (`DISCORD_BOT_TOKEN`, `OWNER_DISCORD_ID`, `ALLOWED_CHANNEL_IDS`, `PROJECT_ROOT`, `RUNS_DIR`) |
 | `README.md` | 한국어 사용자 문서. Discord 앱 생성 → 권한 설정 → ID 확보 → `.env` 작성 → 실행 순서 |
 | `working_m.gif` | 작업 중 상태 메시지에 첨부되는 애니메이션 (192KB). `src/status.py`가 참조하는 유일한 GIF |
-| `working.gif` | 54MB 원본 GIF. **코드·문서 어디에서도 참조되지 않는 미사용 자산** |
 | `logo.png`, `example.jpeg` | README용 이미지 |
 
 ## Subdirectories
