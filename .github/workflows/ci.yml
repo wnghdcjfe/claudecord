@@ -15,9 +15,11 @@ jobs:
     name: test (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     # Windows is a supported target -- the repo ships setup.ps1, run_bot.ps1 and
-    # register_scheduled_task.ps1 -- but the suite has never been run there, so
-    # it reports without blocking until someone has watched it go green.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    # register_scheduled_task.ps1 -- and it carried continue-on-error until
+    # someone had watched the suite go green there. It now does, so the lane
+    # blocks like the others. Keeping the exemption is what let the lane stay
+    # red on every run from the day CI was added: the run reports success and
+    # only the job shows the failure, which nobody chases.
     strategy:
       fail-fast: false
       matrix:
