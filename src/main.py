@@ -8,9 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
-from src.auth import is_authorized
+from src.auth import ensure_configured, is_authorized
+from src.errors import redact_paths, safe_error_text
 from src.greetings import direct_reply_for
-from src.orchestrator import allocate_job, prepare_job, run_job
+from src.orchestrator import allocate_job, cleanup_old_runs, prepare_job, run_job
 from src.outputs import send_outputs
 from src.parser import parse
 from src.runner import (
@@ -62,6 +63,17 @@ DEFAULT_JOB_TIMEOUT_SECONDS = 600.0
 MAX_CONCURRENT_JOBS_ENV_VAR = "MAX_CONCURRENT_JOBS"
 DEFAULT_MAX_CONCURRENT_JOBS = 2
 
+# Issue #25: the recommended deployment is launchd / Task Scheduler, so nobody
+# is watching a terminal. LOG_LEVEL is how an operator turns the detail up
+# after the fact without editing code.
+# INFO, not WARNING: with nobody watching a terminal, the normal-flow records
+# (which job ran, which session it resumed) are exactly what makes "가끔 대화가
+# 안 이어져요" traceable after the fact.
+LOG_LEVEL_ENV_VAR = "LOG_LEVEL"
+DEFAULT_LOG_LEVEL = logging.INFO
+LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
@@ -70,6 +82,39 @@ client = discord.Client(intents=intents)
 # jobs holding or waiting for a slot. Rebuilt lazily -- see _resolve_job_gate.
 _job_gate_state: tuple[int, asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
 _jobs_pending = 0
+
+
+def _resolve_log_level(raw: str) -> int | None:
+    """The logging level `raw` names, or None if it names none.
+
+    None rather than a silent default so the caller can say so out loud: a
+    typo here would otherwise hide every log line the operator went looking
+    for, with nothing to explain why.
+    """
+    if not raw:
+        return DEFAULT_LOG_LEVEL
+    # getLevelName returns the string "Level FOO" for anything it does not
+    # know, which is how an unrecognised name is detected here.
+    level = logging.getLevelName(raw.upper())
+    return level if isinstance(level, int) else None
+
+
+def _configure_logging() -> None:
+    raw = os.environ.get(LOG_LEVEL_ENV_VAR, "").strip()
+    level = _resolve_log_level(raw)
+    # A typo in LOG_LEVEL is a reason to log more than intended, never a
+    # reason for the bot not to start.
+    logging.basicConfig(level=DEFAULT_LOG_LEVEL if level is None else level, format=LOG_FORMAT)
+    if level is None:
+        # Warned after basicConfig so it goes through the handler just
+        # installed, rather than logging's lastResort stderr fallback.
+        logger.warning(
+            "%s=%r is not a log level name; using %s. Expected one of %s.",
+            LOG_LEVEL_ENV_VAR,
+            raw,
+            logging.getLevelName(DEFAULT_LOG_LEVEL),
+            ", ".join(LOG_LEVEL_NAMES),
+        )
 
 
 def _job_timeout_seconds() -> float | None:
@@ -274,7 +319,21 @@ async def _complete_job(
 
 @client.event
 async def on_ready():
-    print(f"[bot] logged in as {client.user}")
+    logger.info("logged in as %s", client.user)
+
+    # Issue #22: startup is the only sweep this bot gets, so it has to happen
+    # here. Off the event loop, though: this is an rmtree over up to a
+    # retention window's worth of job directories (each with its own outputs
+    # and logs), and on_ready shares the loop with discord.py's gateway
+    # heartbeat -- a long blocking delete there reads as a dead connection and
+    # drops the session. Same reason the job-file writes moved off the loop in
+    # issue #3.
+    #
+    # Deliberately not wrapped: cleanup_old_runs catches and logs every one of
+    # its own failures, so a try/except here would only obscure that contract.
+    removed = await asyncio.to_thread(cleanup_old_runs)
+    if removed:
+        logger.info("removed %s stale run directories", removed)
 
 
 @client.event
@@ -422,9 +481,14 @@ async def _prepare_queued_job(
             await asyncio.to_thread(prepare_job, job_dir, cmd.prompt, None, system_hint)
             return None, system_hint, explicit_session
 
+        # The full message (with the real path) goes to the log, where the
+        # operator can read it; the channel gets the redacted form. Issue #26:
+        # prepare_job names the missing directory by absolute path, and a
+        # Discord message is permanent.
+        logger.warning("job %s could not be prepared: %s", job_dir.name, exc)
         status_line = f"작업 실패 · {job_dir.name}"
         await _safe_edit_ack(ack, status_line)
-        await msg.channel.send(f"실행 불가: {exc}")
+        await msg.channel.send(f"실행 불가: {redact_paths(str(exc))}")
         await _complete_job(ack, status_line, job_dir, timings)
         return None
 
@@ -478,9 +542,15 @@ async def _execute_job(
         # its own (stale "작업중입니다") edit that completes afterward,
         # clobbering the failure message the user actually sees.
         await stop_spinning_loader(loader_task)
+        # Issue #26: `str(exc)` on this path is routinely a FileNotFoundError
+        # or PermissionError carrying an absolute path, i.e. the operator's
+        # account name and the layout of their disk. The stack trace and the
+        # unredacted message stay in the log; the channel gets the type name,
+        # the redacted message, and the job id to look the rest up by.
+        logger.exception("job %s raised while running", job_dir.name)
         status_line = f"작업 실패 · {job_dir.name}"
         await _safe_edit_ack(ack, status_line)
-        await msg.channel.send(f"내부 오류: {exc}")
+        await msg.channel.send(f"내부 오류: {safe_error_text(exc)} (`{job_dir.name}`)")
         await _complete_job(ack, status_line, job_dir, timings)
         return
     finally:
@@ -506,7 +576,12 @@ async def _execute_job(
     status_line = f"{status} · {job_dir.name}"
     await _safe_edit_ack(ack, status_line)
     if failed and meta.get("text"):
-        await msg.channel.send(str(meta["text"])[:1900])
+        # The CLI's own failure text names the directory it could not use, so
+        # it needs the same redaction (#26). Redacted before truncation --
+        # slicing first could cut a path in half and hand the tail through
+        # unmatched.
+        logger.warning("job %s failed: %s", job_dir.name, meta["text"])
+        await msg.channel.send(redact_paths(str(meta["text"]))[:1900])
     await send_outputs(
         msg.channel,
         job_dir,
@@ -556,6 +631,11 @@ async def _handle_job_timeout(
 
 
 def main():
+    # Logging first, so a configuration failure below is itself reportable.
+    _configure_logging()
+    # Issue #9: bad or missing auth config must stop the bot here, with a
+    # Korean message, rather than silently rejecting every message later.
+    ensure_configured()
     client.run(os.environ["DISCORD_BOT_TOKEN"])
 
 

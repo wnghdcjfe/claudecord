@@ -27,6 +27,25 @@ WORKING_GIF_TRUTHY_VALUES = {"1", "true", "yes", "on"}
 EDIT_INTERVAL_SECONDS = 2.5
 DISCORD_EDIT_RATE_LIMIT_PER_SECOND = 1.0  # 5 edits / 5 seconds
 
+# Issue #19: a *fixed* interval makes the edit count grow linearly with job
+# duration, and 5-10 minute Claude Code jobs are normal here -- at a flat 2.5s
+# that is 120-240 edits into one channel's edit bucket for a single job. So the
+# interval grows after every edit instead, up to a ceiling.
+#
+# Growth is 1.5 rather than 2.0 because the first minute is the window where
+# the user is still asking "did it even take?": 1.5 spends 6 edits there and
+# only then thins out, whereas 2.0 would be down to one edit per 20s before the
+# job is 40 seconds old. The ceiling is reached ~80s in, after 7 edits.
+#
+# The ceiling exists because unbounded growth eventually leaves a long job with
+# no sign of life for minutes at a time. 30s also bounds how stale the "경과
+# MM:SS" counter in the status line can be, which is what tells the user the
+# job is still moving once the edits thin out.
+#
+# Net effect: a 10-minute job costs ~24 edits instead of 240.
+EDIT_INTERVAL_GROWTH = 1.5
+MAX_EDIT_INTERVAL_SECONDS = 30.0
+
 # Fallback labels keyed by minimum elapsed seconds, used only until we learn
 # a real tool name or turn count from the stream. Unlike the old animation,
 # these are driven by the wall clock (time.monotonic()), not a looping index.
@@ -160,9 +179,16 @@ async def run_spinning_loader(
     progress: "JobProgress | None" = None,
     *,
     interval: float = EDIT_INTERVAL_SECONDS,
+    growth: float = EDIT_INTERVAL_GROWTH,
+    max_interval: float = MAX_EDIT_INTERVAL_SECONDS,
 ) -> None:
+    delay = interval
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(delay)
+        # Backed off *after* the sleep, so the first edit still lands at
+        # `interval` -- the point of the curve is to thin out later ticks,
+        # not to delay the first sign that the job started.
+        delay = min(delay * growth, max_interval)
         try:
             await message.edit(content=format_working_status(job_name, progress))
         except (discord.DiscordException, OSError):

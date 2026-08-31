@@ -7,9 +7,13 @@ from itertools import pairwise
 from pathlib import Path
 from unittest import mock
 
+import discord
+
 from src import status
 from src.status import (
+    EDIT_INTERVAL_GROWTH,
     EDIT_INTERVAL_SECONDS,
+    MAX_EDIT_INTERVAL_SECONDS,
     QUEUED_MESSAGE,
     WORKING_GIF_FILENAME,
     WORKING_MESSAGE,
@@ -43,6 +47,34 @@ class FakeMessage:
             self.progress.tool = "Bash"
         if len(self.edits) >= self.target_edits:
             self.ready.set()
+
+
+def _record_sleeps(*, target_edits: int, **loader_kwargs) -> list[float]:
+    """Drive run_spinning_loader and return the delays it actually awaited.
+
+    asyncio.sleep is replaced with a spy that yields immediately, so a curve
+    that would take minutes of wall clock is observed in milliseconds.
+    """
+
+    async def scenario():
+        message = FakeMessage(target_edits=target_edits)
+        sleep_calls: list[float] = []
+        real_sleep = asyncio.sleep
+
+        async def spy_sleep(seconds):
+            sleep_calls.append(seconds)
+            await real_sleep(0)
+
+        with mock.patch("src.status.asyncio.sleep", spy_sleep):
+            task = asyncio.create_task(
+                run_spinning_loader(message, "job-123", **loader_kwargs)
+            )
+            await asyncio.wait_for(message.ready.wait(), timeout=5)
+            await stop_spinning_loader(task)
+
+        return sleep_calls
+
+    return asyncio.run(scenario())
 
 
 class StatusTests(unittest.TestCase):
@@ -131,29 +163,15 @@ class StatusTests(unittest.TestCase):
 
     def test_run_spinning_loader_sleeps_for_edit_interval_seconds_when_uncalled_with_override(self):
         # Exercises the exact call main.py makes (no `interval=` override)
-        # and proves the *running* loop waits EDIT_INTERVAL_SECONDS between
-        # edits, by spying on the real asyncio.sleep it awaits -- not by
-        # reading an unexercised function-signature default.
-        async def scenario():
-            message = FakeMessage(target_edits=2)
-            sleep_calls = []
-            real_sleep = asyncio.sleep
-
-            async def spy_sleep(seconds):
-                sleep_calls.append(seconds)
-                await real_sleep(0)
-
-            with mock.patch("src.status.asyncio.sleep", spy_sleep):
-                task = asyncio.create_task(run_spinning_loader(message, "job-123"))
-                await asyncio.wait_for(message.ready.wait(), timeout=1)
-                await stop_spinning_loader(task)
-
-            return sleep_calls
-
-        sleep_calls = asyncio.run(scenario())
+        # and proves the *running* loop waits EDIT_INTERVAL_SECONDS before its
+        # first edit, by spying on the real asyncio.sleep it awaits -- not by
+        # reading an unexercised function-signature default. The first wait is
+        # what the user actually feels; later waits back off (see the backoff
+        # tests below).
+        sleep_calls = _record_sleeps(target_edits=2)
 
         self.assertGreaterEqual(len(sleep_calls), 2)
-        self.assertTrue(all(seconds == EDIT_INTERVAL_SECONDS for seconds in sleep_calls))
+        self.assertEqual(sleep_calls[0], EDIT_INTERVAL_SECONDS)
 
     def test_spinning_loader_spaces_real_edits_by_at_least_the_given_interval(self):
         # No mocked clock: a real (short) interval, real asyncio.sleep, real
@@ -321,6 +339,103 @@ class StatusTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"WORKING_GIF": "true"}, clear=False),
         ):
             self.assertIsNone(make_working_gif_file())
+
+
+class SpinnerBackoffTests(unittest.TestCase):
+    """Issue #19: the edit interval grows as a job runs long, so total edits
+    against Discord's per-channel edit bucket stop scaling linearly with job
+    duration."""
+
+    def test_the_first_edit_still_lands_at_the_base_interval(self):
+        # Backing off must not delay the first sign that the job started --
+        # the curve is there to thin out *later* ticks.
+        delays = _record_sleeps(target_edits=1)
+
+        self.assertEqual(delays[0], EDIT_INTERVAL_SECONDS)
+
+    def test_each_successive_wait_grows_by_the_configured_factor(self):
+        delays = _record_sleeps(target_edits=5)
+
+        expected = [EDIT_INTERVAL_SECONDS * EDIT_INTERVAL_GROWTH**i for i in range(5)]
+        for actual, want in zip(delays[:5], expected, strict=True):
+            self.assertAlmostEqual(actual, want, places=6)
+        # Sanity: this is a real increase, not a rounding artefact.
+        self.assertGreater(delays[4], delays[0] * 2)
+
+    def test_the_interval_stops_growing_at_the_ceiling(self):
+        # Unbounded growth would eventually leave a long job with no visible
+        # sign of life for minutes at a time.
+        delays = _record_sleeps(target_edits=40)
+
+        self.assertLessEqual(max(delays), MAX_EDIT_INTERVAL_SECONDS)
+        self.assertEqual(delays[-1], MAX_EDIT_INTERVAL_SECONDS)
+
+    def test_the_ceiling_is_reached_within_the_first_couple_of_minutes(self):
+        # If the curve took most of a job to flatten, the cap would be doing
+        # no work on the 5-10 minute jobs this exists for.
+        delays = _record_sleeps(target_edits=40)
+
+        elapsed = 0.0
+        for index, delay in enumerate(delays):
+            elapsed += delay
+            if delay == MAX_EDIT_INTERVAL_SECONDS:
+                self.assertLess(elapsed, 120)
+                self.assertLess(index, 12)
+                return
+        self.fail("the interval never reached the ceiling")
+
+    def test_a_ten_minute_job_costs_far_fewer_edits_than_a_flat_interval(self):
+        # Issue #19's completion criterion, measured against the curve the
+        # loader actually runs rather than by re-deriving it from constants.
+        delays = _record_sleeps(target_edits=200)
+
+        job_seconds = 600.0
+        elapsed = 0.0
+        edits = 0
+        for delay in delays:
+            elapsed += delay
+            if elapsed > job_seconds:
+                break
+            edits += 1
+
+        flat_interval_edits = job_seconds / EDIT_INTERVAL_SECONDS
+        self.assertEqual(flat_interval_edits, 240)
+        self.assertLess(edits, flat_interval_edits / 5)
+        # ...while still updating often enough to read as a live job.
+        self.assertGreater(edits, 10)
+
+    def test_the_backoff_curve_is_overridable_for_callers_and_tests(self):
+        delays = _record_sleeps(target_edits=4, interval=1.0, growth=3.0, max_interval=5.0)
+
+        self.assertEqual(delays[:4], [1.0, 3.0, 5.0, 5.0])
+
+
+class SpinnerFailureLoggingTests(unittest.TestCase):
+    def test_a_loader_killed_by_discord_says_so_in_the_log(self):
+        # Issue #19/#25: the loop used to swallow DiscordException and stop,
+        # so a rate-limited spinner froze the status line with no trace of why.
+        async def scenario():
+            class DeadMessage:
+                async def edit(self, *, content=None):
+                    raise discord.DiscordException("rate limited")
+
+            task = asyncio.create_task(
+                run_spinning_loader(DeadMessage(), "job-123", interval=0)
+            )
+            for _ in range(50):
+                await asyncio.sleep(0)
+                if task.done():
+                    break
+            self.assertTrue(task.done())
+            await stop_spinning_loader(task)
+
+        with self.assertLogs("src.status", level="WARNING") as captured:
+            asyncio.run(scenario())
+
+        self.assertTrue(any("stopping loader" in line for line in captured.output))
+        # exc_info=True: the reason the spinner died is in the log too, which
+        # is the whole point -- a frozen status line is otherwise unexplained.
+        self.assertTrue(any("DiscordException" in line for line in captured.output))
 
 
 class QueuedStatusTests(unittest.TestCase):

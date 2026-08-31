@@ -22,48 +22,85 @@ from pathlib import Path
 # text stays in the log where it is useful.
 MAX_ERROR_CHARS = 400
 
-# `/Users/<name>/` (macOS), `/home/<name>/` (Linux). The trailing separator is
-# required so a bare `/home` -- which names no individual -- is left alone.
-_POSIX_HOME = re.compile(r"/(?:Users|home)/[^/\s]+/")
+# One alternation, tried in order, so each path is consumed exactly once and
+# the result is idempotent (orchestrator.py redacts when it raises and main.py
+# redacts again when it sends).
+#
+#   url       matched first and returned untouched. Without it,
+#             `https://example.com/a/b` came back as `https:/.../b` -- not a
+#             leak, but it destroys the one part of an error a user can act on.
+#             Two carve-outs, because a URL is only exempt where it is not
+#             secretly a path: `file://` is skipped entirely (it *is* an
+#             absolute path, wearing a scheme), and the match stops at `?`/`#`
+#             so a path spelled inside a query string still gets redacted.
+#             The lookbehind pins the scheme to a word start: without it the
+#             engine simply stepped one character past the blocked `file:` and
+#             matched `ile://...` as a scheme of its own.
+#   winhome / posixhome
+#             a home directory plus everything under it, so the replacement is
+#             `~` + the useful tail in a single step. Both capture the tail
+#             rather than stopping at the account name: matching only
+#             `/Users/jane/` (with a trailing slash) let a bare `/Users/jane`
+#             fall through to `abspath`, whose "keep the last segment" rule
+#             then published the account name as `.../jane`.
+#             winhome precedes posixhome so `C:/Users/jane/x` -- a Windows path
+#             spelled with forward slashes, which Python echoes back verbatim --
+#             is not mistaken for a POSIX one.
+#   abspath   any other absolute path: the directories above the last segment
+#             describe the machine rather than the failure. The lookbehind
+#             keeps it off paths an earlier rule already anchored, so `~/a/b`
+#             and `.../b` survive a second pass unchanged; the `(?!~/)` does
+#             the same one character later, for the `file://~/a/b` a previous
+#             pass produced. Idempotence matters because orchestrator.py
+#             redacts when it raises and main.py redacts again when it sends.
+_REDACT = re.compile(
+    r"(?P<url>(?<![A-Za-z0-9+.\-])(?![Ff][Ii][Ll][Ee]:)[A-Za-z][A-Za-z0-9+.\-]*://[^\s?#]*)"
+    r"|(?P<winhome>[A-Za-z]:[\\/]Users[\\/][^\\/\s]+(?:[\\/]\S*)?)"
+    r"|(?P<posixhome>/(?:Users|home)/[^/\s]+(?:/\S*)?)"
+    r"|(?P<abspath>(?<![~\w.])/(?!~/)(?:[^/\s]+/)+[^/\s]*)"
+)
 
-# `C:\Users\<name>\`. Drive letter is any letter; separators may be either
-# slash, since Windows accepts both and Python echoes back whichever it got.
-_WINDOWS_HOME = re.compile(r"[A-Za-z]:[\\/]Users[\\/][^\\/\s]+[\\/]")
 
-# A remaining absolute POSIX path: a leading slash followed by at least two
-# segments. One segment (`/tmp`) names nothing personal; two or more
-# (`/opt/secret-client/build`) can. The lookbehind keeps this off paths that
-# an earlier rule already anchored -- `~/Desktop/x` must not have its
-# `/Desktop/x` tail clipped a second time.
-_ABSOLUTE_PATH = re.compile(r"(?<![~\w.])/(?:[^/\s]+/)+[^/\s]*")
+def _replace(match: re.Match[str]) -> str:
+    if match.group("url") is not None:
+        return match.group("url")
+
+    windows = match.group("winhome")
+    if windows is not None:
+        # Drop `<drive>:<sep>Users<sep><account>`, keep the tail as typed so the
+        # separator style the reader saw is the one they get back.
+        tail = re.sub(r"^[A-Za-z]:[\\/]Users[\\/][^\\/\s]+", "", windows)
+        return "~" + tail
+
+    posix = match.group("posixhome")
+    if posix is not None:
+        return "~" + re.sub(r"^/(?:Users|home)/[^/\s]+", "", posix)
+
+    segment = match.group("abspath").rstrip("/").rsplit("/", 1)[-1]
+    return f".../{segment}" if segment else "..."
 
 
 def redact_paths(text: str) -> str:
     """Replace absolute filesystem paths with non-identifying equivalents.
 
-    Home directories collapse to ``~/``, keeping the part of the path that
-    actually helps the reader ("which file failed") while dropping the account
-    name. Any other absolute path is reduced to its last segment, since the
-    directories above it describe the machine rather than the failure.
+    Home directories collapse to ``~``, keeping the part of the path that
+    helps the reader ("which file failed") while dropping the account name.
+    Any other absolute path is reduced to its last segment. URLs are left
+    alone. Applying this twice gives the same answer as applying it once.
     """
     if not text:
         return text
 
-    # The running user's own home first, so `/Users/jane/x` becomes `~/x`
-    # rather than being caught by the generic rule below.
+    # The running user's own home first, in case it lives somewhere the
+    # patterns below do not recognise (`/var/root`, a relocated profile).
+    # The lookahead demands a real boundary so a sibling account whose name
+    # merely starts with ours -- `/Users/janet` next to `/Users/jane` -- is
+    # left for the generic rule instead of becoming `~t`.
     home = str(Path.home())
     if home and home != os.sep:
-        text = text.replace(home + os.sep, "~" + os.sep)
-        text = text.replace(home, "~")
+        text = re.sub(re.escape(home) + r"(?=[/\\]|\s|$)", "~", text)
 
-    text = _POSIX_HOME.sub("~/", text)
-    text = _WINDOWS_HOME.sub("~\\\\", text)
-
-    def _tail(match: re.Match[str]) -> str:
-        segment = match.group(0).rstrip("/").rsplit("/", 1)[-1]
-        return f".../{segment}" if segment else "..."
-
-    return _ABSOLUTE_PATH.sub(_tail, text)
+    return _REDACT.sub(_replace, text)
 
 
 def safe_error_text(exc: BaseException, *, limit: int = MAX_ERROR_CHARS) -> str:
@@ -74,6 +111,10 @@ def safe_error_text(exc: BaseException, *, limit: int = MAX_ERROR_CHARS) -> str:
     """
     message = redact_paths(str(exc)).strip()
     rendered = f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+    # A cap of zero or less means "no room", not "skip the cap" -- slicing with
+    # `limit - 1` would otherwise hand back all but the final character.
+    if limit <= 0:
+        return ""
     if len(rendered) > limit:
         rendered = rendered[: limit - 1].rstrip() + "…"
     return rendered

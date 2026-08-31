@@ -1,19 +1,36 @@
 import asyncio
+import contextlib
 import json
+import logging
 import os
 import sys
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from src import main, orchestrator, runner, sessions
-from src.parser import PROJECTS, Command
+from src import auth, main, orchestrator, runner, sessions
+from src.parser import Command
 from src.sessions import SessionState
 from src.status import QUEUED_MESSAGE, WORKING_MESSAGE, run_spinning_loader
 from src.timing import SPAN_ACK, SPAN_OUTPUTS, SPAN_SPAWN, SPAN_TOTAL, JobTimings
 from src.warm_pool import WarmClaudePool, WarmKey, WarmProcess
+
+# src/parser.py used to hard-code a PROJECTS dict; project tags now come from
+# a projects.toml resolved via PROJECTS_FILE (issue #16). These tests are about
+# what main.py does with a project's hint, so they supply their own one-project
+# config rather than depending on whatever the running machine has.
+SAMPLE_PROJECT_HINT = "샘플 프로젝트. 보안 정보 출력 금지."
+
+
+def _write_projects_file(directory: Path, *, name: str, dirname: str, hint: str) -> Path:
+    path = directory / "projects.toml"
+    path.write_text(
+        f'[{name}]\ndir = "{dirname}"\nhint = "{hint}"\n', encoding="utf-8"
+    )
+    return path
 
 
 async def _spawn_sleeper():
@@ -127,8 +144,8 @@ class MainSessionRecoveryTests(unittest.TestCase):
             "get_session_state",
             return_value=SessionState(
                 "sess-1",
-                workdir="/tmp/avisspick",
-                system_hint="어비스픽 투자 리포트 서비스. 보안 정보 출력 금지.",
+                workdir="/tmp/sample",
+                system_hint=SAMPLE_PROJECT_HINT,
             ),
         ):
             resume_id, workdir, system_hint, _explicit = main._resolve_resume_and_workdir(
@@ -137,8 +154,8 @@ class MainSessionRecoveryTests(unittest.TestCase):
             )
 
         self.assertEqual(resume_id, "sess-1")
-        self.assertEqual(workdir, "/tmp/avisspick")
-        self.assertEqual(system_hint, "어비스픽 투자 리포트 서비스. 보안 정보 출력 금지.")
+        self.assertEqual(workdir, "/tmp/sample")
+        self.assertEqual(system_hint, SAMPLE_PROJECT_HINT)
 
     def test_a_tag_on_this_message_wins_over_the_stored_hint(self):
         with mock.patch.object(
@@ -1267,7 +1284,7 @@ class ProgressWiringTests(unittest.TestCase):
 
 
 class ProjectHintPersistenceTests(unittest.TestCase):
-    """H2: `@avisspick 분석해줘` followed by an untagged `API 키 설정은?`.
+    """H2: `@sample 분석해줘` followed by an untagged `API 키 설정은?`.
 
     The project's rules ride --append-system-prompt and are therefore re-sent
     on every turn, but the hint that produces them used to live only in the
@@ -1280,11 +1297,14 @@ class ProjectHintPersistenceTests(unittest.TestCase):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
                 projects = Path(tmp) / "projects"
-                (projects / "avisspick").mkdir(parents=True)
+                (projects / "sample").mkdir(parents=True)
                 runs = Path(tmp) / "runs"
                 runs.mkdir()
                 store = Path(tmp) / "sessions.json"
-                project_dir = projects / "avisspick"
+                project_dir = projects / "sample"
+                projects_file = _write_projects_file(
+                    Path(tmp), name="sample", dirname="sample", hint=SAMPLE_PROJECT_HINT
+                )
 
                 seen = []
 
@@ -1294,7 +1314,7 @@ class ProjectHintPersistenceTests(unittest.TestCase):
                     seen.append((job_dir, resume))
                     return {
                         "type": "result",
-                        "session_id": "sess-avisspick",
+                        "session_id": "sess-sample",
                         "workdir": str(project_dir),
                         "text_body": "답변",
                     }
@@ -1312,12 +1332,13 @@ class ProjectHintPersistenceTests(unittest.TestCase):
                         {
                             "RUNS_DIR": str(runs),
                             "PROJECT_ROOT": str(projects),
+                            "PROJECTS_FILE": str(projects_file),
                             "WORKING_GIF": "0",
                         },
                         clear=False,
                     ),
                 ):
-                    await send("@avisspick 보안 점검해줘")
+                    await send("@sample 보안 점검해줘")
                     await send("API 키 설정은?")
                     stored = sessions.get_session_state(777)
 
@@ -1331,7 +1352,7 @@ class ProjectHintPersistenceTests(unittest.TestCase):
 
         self.assertEqual(len(metas), 2)
         # Turn 2 continues the same conversation, in the same directory...
-        self.assertEqual(resumes, [None, "sess-avisspick"])
+        self.assertEqual(resumes, [None, "sess-sample"])
         self.assertEqual(metas[1]["workdir"], project_path)
         # ...and, the actual fix, under the same constraints.
         self.assertIn("보안 정보 출력 금지", metas[0]["system_prompt"])
@@ -1340,8 +1361,8 @@ class ProjectHintPersistenceTests(unittest.TestCase):
 
         # The hint is what makes that survivable across restarts, so it has to
         # be in the store, not just in this process.
-        self.assertEqual(stored.session_id, "sess-avisspick")
-        self.assertEqual(stored.system_hint, PROJECTS["@avisspick"][1])
+        self.assertEqual(stored.session_id, "sess-sample")
+        self.assertEqual(stored.system_hint, SAMPLE_PROJECT_HINT)
 
     def test_a_stable_hint_keeps_the_warm_pool_key_stable_between_turns(self):
         # Side effect of the same fix, worth pinning: WarmKey includes the
@@ -1349,13 +1370,13 @@ class ProjectHintPersistenceTests(unittest.TestCase):
         # the parked process from turn 1 can never be reused. Issue #2's whole
         # point is that turn 2 is the turn that gets to skip the 1.4~1.6s
         # cold spawn.
-        turn_one = orchestrator._build_system_prompt(PROJECTS["@avisspick"][1])
-        turn_two_fixed = orchestrator._build_system_prompt(PROJECTS["@avisspick"][1])
+        turn_one = orchestrator._build_system_prompt(SAMPLE_PROJECT_HINT)
+        turn_two_fixed = orchestrator._build_system_prompt(SAMPLE_PROJECT_HINT)
         turn_two_broken = orchestrator._build_system_prompt(None)
 
         def key(system_prompt):
             return WarmKey(
-                workdir="/tmp/avisspick",
+                workdir="/tmp/sample",
                 model=runner.DEFAULT_CLAUDE_MODEL,
                 system_hint=system_prompt,
             )
@@ -1677,3 +1698,435 @@ class AckIsNotBlockedByJobFileWritesTests(unittest.TestCase):
         threads = asyncio.run(scenario())
         self.assertEqual(len(threads), 1)
         self.assertNotEqual(threads[0], threading.main_thread())
+
+
+LEAKY_HOME = "/Users/janedoe"
+
+
+async def _run_failing_job(msg, job_dir, *, run_job=None, prepare_job=None):
+    """Drive on_message for a job that fails, with the pieces under test real.
+
+    Only the collaborators that would touch Discord or the network are faked;
+    the error-reporting path itself (which is what these tests are about) runs
+    for real.
+    """
+    patches = [
+        mock.patch.object(main, "is_authorized", return_value=True),
+        mock.patch.object(main, "allocate_job", return_value=job_dir),
+        mock.patch.object(main, "get_session_state", return_value=None),
+        mock.patch.object(main, "set_session"),
+        mock.patch.object(main, "send_outputs", mock.AsyncMock()),
+        mock.patch.dict(
+            os.environ, {"WORKING_GIF": "0", "DEBUG_TIMING": "0"}, clear=False
+        ),
+    ]
+    if run_job is not None:
+        patches.append(mock.patch.object(main, "run_job", run_job))
+    if prepare_job is not None:
+        patches.append(mock.patch.object(main, "prepare_job", prepare_job))
+
+    with contextlib.ExitStack() as stack:
+        for patch in patches:
+            stack.enter_context(patch)
+        await main.on_message(msg)
+
+
+class RedactedErrorOutputTests(unittest.TestCase):
+    """Issue #26: nothing on an error path may hand Discord an absolute path.
+
+    Discord keeps every message it is given, and this bot runs on someone's
+    personal machine -- the paths in a Python exception spell out that
+    person's account name and disk layout.
+    """
+
+    def _job_dir(self, tmp: str, name: str) -> Path:
+        job_dir = Path(tmp) / name
+        (job_dir / "logs").mkdir(parents=True)
+        return job_dir
+
+    def test_a_crash_carrying_an_absolute_path_never_shows_it_in_the_channel(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                channel = FakeChannel()
+                msg = FakeMessage("요청", channel, FakeAck())
+
+                async def exploding_run_job(
+                    passed_job_dir, resume=None, *, on_event=None, timings=None, scope=None
+                ):
+                    raise FileNotFoundError(
+                        2,
+                        "No such file or directory",
+                        f"{LEAKY_HOME}/Desktop/private/notes.md",
+                    )
+
+                await _run_failing_job(
+                    msg, self._job_dir(tmp, "job-redact1"), run_job=exploding_run_job
+                )
+                return channel.sent
+
+        sent = asyncio.run(scenario())
+
+        errors = [entry["content"] for entry in sent if "내부 오류" in (entry["content"] or "")]
+        self.assertEqual(len(errors), 1)
+        reported = errors[0]
+        self.assertNotIn(LEAKY_HOME, reported)
+        self.assertNotIn("janedoe", reported)
+        self.assertNotIn("/Users/", reported)
+        # What survives is the part that helps: the exception type, the file
+        # that failed relative to a home, and the job id to grep the log by.
+        self.assertIn("FileNotFoundError", reported)
+        self.assertIn("~/Desktop/private/notes.md", reported)
+        self.assertIn("job-redact1", reported)
+
+    def test_the_unredacted_exception_and_its_traceback_stay_in_the_log(self):
+        # The operator diagnoses from the log, so redaction must apply to the
+        # channel only -- a redacted log would just move the problem.
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                msg = FakeMessage("요청", FakeChannel(), FakeAck())
+
+                async def exploding_run_job(
+                    passed_job_dir, resume=None, *, on_event=None, timings=None, scope=None
+                ):
+                    raise FileNotFoundError(
+                        2, "No such file or directory", f"{LEAKY_HOME}/Desktop/notes.md"
+                    )
+
+                await _run_failing_job(
+                    msg, self._job_dir(tmp, "job-redact2"), run_job=exploding_run_job
+                )
+
+        with self.assertLogs("src.main", level="ERROR") as captured:
+            asyncio.run(scenario())
+
+        logged = "\n".join(captured.output)
+        self.assertIn(f"{LEAKY_HOME}/Desktop/notes.md", logged)
+        self.assertIn("Traceback", logged)
+        self.assertIn("job-redact2", logged)
+
+    def test_a_missing_working_directory_is_reported_without_naming_it(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                channel = FakeChannel()
+                msg = FakeMessage("요청", channel, FakeAck())
+
+                def refusing_prepare(*args, **kwargs):
+                    raise ValueError(
+                        f"작업 디렉터리가 없습니다: {LEAKY_HOME}/work/deleted-project"
+                    )
+
+                await _run_failing_job(
+                    msg, self._job_dir(tmp, "job-redact3"), prepare_job=refusing_prepare
+                )
+                return channel.sent
+
+        sent = asyncio.run(scenario())
+
+        errors = [entry["content"] for entry in sent if "실행 불가" in (entry["content"] or "")]
+        self.assertEqual(len(errors), 1)
+        reported = errors[0]
+        self.assertNotIn("janedoe", reported)
+        self.assertNotIn("/Users/", reported)
+        # The Korean explanation is what the user needs; only the path goes.
+        self.assertIn("작업 디렉터리가 없습니다", reported)
+        self.assertIn("~/work/deleted-project", reported)
+
+    def test_the_clis_own_failure_text_is_redacted_too(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                channel = FakeChannel()
+                msg = FakeMessage("요청", channel, FakeAck())
+
+                async def failing_run_job(
+                    passed_job_dir, resume=None, *, on_event=None, timings=None, scope=None
+                ):
+                    return {
+                        "type": "error",
+                        "text": f"cwd {LEAKY_HOME}/repos/client-x does not exist",
+                    }
+
+                await _run_failing_job(
+                    msg, self._job_dir(tmp, "job-redact4"), run_job=failing_run_job
+                )
+                return channel.sent
+
+        sent = asyncio.run(scenario())
+
+        reported = [entry["content"] for entry in sent if entry["content"]]
+        self.assertTrue(reported)
+        joined = "\n".join(reported)
+        self.assertNotIn("janedoe", joined)
+        self.assertNotIn("/Users/", joined)
+        self.assertIn("~/repos/client-x does not exist", joined)
+
+    def test_long_cli_error_text_is_redacted_before_it_is_truncated(self):
+        # Truncating first would slice a path in half and forward the leading
+        # half unmatched -- "/Users/jan" still names the account.
+        filler = "x" * 1885
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                channel = FakeChannel()
+                msg = FakeMessage("요청", channel, FakeAck())
+
+                async def failing_run_job(
+                    passed_job_dir, resume=None, *, on_event=None, timings=None, scope=None
+                ):
+                    return {
+                        "type": "error",
+                        "text": f"{filler}{LEAKY_HOME}/secret/f.txt",
+                    }
+
+                await _run_failing_job(
+                    msg, self._job_dir(tmp, "job-redact5"), run_job=failing_run_job
+                )
+                return channel.sent
+
+        sent = asyncio.run(scenario())
+
+        joined = "\n".join(entry["content"] for entry in sent if entry["content"])
+        self.assertNotIn("/Users/", joined)
+        self.assertNotIn("janedoe", joined)
+        self.assertNotIn("jan", joined)
+        self.assertIn("~/secret/f.txt", joined)
+
+
+class LoggingConfigurationTests(unittest.TestCase):
+    """Issue #25: the bot is meant to run under launchd with nobody watching a
+    terminal, so the log level has to be adjustable from the environment."""
+
+    def _configure_with(self, value):
+        """Run _configure_logging for a LOG_LEVEL value; return (level, warnings).
+
+        basicConfig is mocked rather than allowed to reconfigure the root
+        logger for real, which would leak into every other test in the suite.
+        """
+        env = {} if value is None else {"LOG_LEVEL": value}
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(main.logging, "basicConfig") as basic_config,
+            self.assertLogs("src.main", level="WARNING") as captured,
+        ):
+            # A no-op record keeps assertLogs from failing the (normal) case
+            # where _configure_logging has nothing to warn about.
+            main.logger.warning("sentinel")
+            main._configure_logging()
+
+        basic_config.assert_called_once()
+        warnings = [line for line in captured.output if "sentinel" not in line]
+        return basic_config.call_args.kwargs["level"], warnings
+
+    def test_the_default_level_is_info_when_log_level_is_unset(self):
+        for value in (None, "", "   "):
+            level, warnings = self._configure_with(value)
+            self.assertEqual(level, logging.INFO)
+            # An unset LOG_LEVEL is the normal case, not a misconfiguration.
+            self.assertEqual(warnings, [])
+
+    def test_a_level_name_is_honoured(self):
+        for name, expected in (
+            ("DEBUG", logging.DEBUG),
+            ("INFO", logging.INFO),
+            ("WARNING", logging.WARNING),
+            ("ERROR", logging.ERROR),
+        ):
+            level, warnings = self._configure_with(name)
+            self.assertEqual(level, expected)
+            self.assertEqual(warnings, [])
+
+    def test_a_level_name_is_case_insensitive_and_may_be_padded(self):
+        self.assertEqual(self._configure_with("debug")[0], logging.DEBUG)
+        self.assertEqual(self._configure_with("  Warning  ")[0], logging.WARNING)
+
+    def test_an_unrecognised_level_falls_back_to_info_and_says_so(self):
+        # A typo in LOG_LEVEL is a reason to log more than intended, never a
+        # reason for the bot not to start -- but silently ignoring it would
+        # hide exactly the log lines the operator went looking for.
+        for value in ("LOUD", "-", "verbose", "10"):
+            level, warnings = self._configure_with(value)
+            self.assertEqual(level, logging.INFO)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("LOG_LEVEL", warnings[0])
+            self.assertIn(repr(value), warnings[0])
+
+    def test_the_fallback_warning_names_the_levels_that_would_have_worked(self):
+        _level, warnings = self._configure_with("LOUD")
+
+        self.assertIn("DEBUG", warnings[0])
+        self.assertIn("WARNING", warnings[0])
+
+    def test_configure_logging_asks_for_a_timestamped_format(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(main.logging, "basicConfig") as basic_config,
+        ):
+            main._configure_logging()
+
+        fmt = basic_config.call_args.kwargs["format"]
+        # Under launchd nobody sees the log until afterwards, so "when" and
+        # "how bad" have to be in the line itself.
+        self.assertIn("%(asctime)s", fmt)
+        self.assertIn("%(levelname)s", fmt)
+        self.assertIn("%(name)s", fmt)
+
+    def test_on_ready_logs_the_connection_instead_of_printing_it(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(os.environ, {"RUNS_DIR": tmp}, clear=False),
+            self.assertLogs("src.main", level="INFO") as captured,
+        ):
+            asyncio.run(main.on_ready())
+
+        self.assertTrue(any("logged in as" in line for line in captured.output))
+
+
+class StartupWiringTests(unittest.TestCase):
+    """Issue #9: running with no environment must stop at startup with a clear
+    Korean message, not accept the connection and then reject every message."""
+
+    def tearDown(self):
+        # The auth config is cached for the process; drop whatever these tests
+        # cached so the rest of the suite reads the ambient environment again.
+        auth._config.cache_clear()
+
+    def test_main_validates_the_auth_config_before_connecting(self):
+        with (
+            mock.patch.object(main, "ensure_configured") as ensure_configured,
+            mock.patch.object(main, "_configure_logging") as configure_logging,
+            mock.patch.object(main.client, "run") as run,
+            mock.patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "t"}, clear=False),
+        ):
+            main.main()
+
+        ensure_configured.assert_called_once_with()
+        configure_logging.assert_called_once_with()
+        run.assert_called_once_with("t")
+
+    def test_a_missing_owner_id_stops_startup_with_a_korean_message(self):
+        auth._config.cache_clear()
+        with (
+            mock.patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "t"}, clear=True),
+            mock.patch.object(main.client, "run") as run,
+            mock.patch.object(main, "_configure_logging"),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            main.main()
+
+        self.assertIn("OWNER_DISCORD_ID", str(caught.exception))
+        self.assertIn("환경변수", str(caught.exception))
+        # It stopped *before* connecting, which is the point.
+        run.assert_not_called()
+
+    def test_a_malformed_owner_id_also_stops_startup(self):
+        auth._config.cache_clear()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"DISCORD_BOT_TOKEN": "t", "OWNER_DISCORD_ID": "not-a-number"},
+                clear=True,
+            ),
+            mock.patch.object(main.client, "run") as run,
+            mock.patch.object(main, "_configure_logging"),
+            self.assertRaises(RuntimeError) as caught,
+        ):
+            main.main()
+
+        self.assertIn("OWNER_DISCORD_ID", str(caught.exception))
+        run.assert_not_called()
+
+
+class StartupCleanupWiringTests(unittest.TestCase):
+    """Issue #22: cleanup_old_runs exists in the orchestrator but only does
+    anything if something calls it. on_ready is that caller."""
+
+    def _stale_job_dir(self, runs: Path, name: str, *, age_days: int) -> Path:
+        job_dir = runs / name
+        (job_dir / "logs").mkdir(parents=True)
+        created = datetime.now(UTC) - timedelta(days=age_days)
+        (job_dir / "job.json").write_text(
+            json.dumps({"created_at": created.isoformat()}), encoding="utf-8"
+        )
+        return job_dir
+
+    def test_on_ready_sweeps_stale_run_directories(self):
+        # End to end against the real cleanup_old_runs: a job older than the
+        # default 30-day retention goes, a fresh one stays.
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            runs.mkdir()
+            stale = self._stale_job_dir(runs, "job-stale", age_days=90)
+            fresh = self._stale_job_dir(runs, "job-fresh", age_days=1)
+
+            with mock.patch.dict(os.environ, {"RUNS_DIR": str(runs)}, clear=False):
+                os.environ.pop("RUNS_RETENTION_DAYS", None)
+                asyncio.run(main.on_ready())
+
+            self.assertFalse(stale.exists())
+            self.assertTrue(fresh.exists())
+
+    def test_on_ready_honours_the_retention_opt_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            runs.mkdir()
+            stale = self._stale_job_dir(runs, "job-stale", age_days=90)
+
+            with mock.patch.dict(
+                os.environ, {"RUNS_DIR": str(runs), "RUNS_RETENTION_DAYS": "0"}, clear=False
+            ):
+                asyncio.run(main.on_ready())
+
+            self.assertTrue(stale.exists())
+
+    def test_the_sweep_runs_off_the_event_loop_thread(self):
+        # It is an unbounded rmtree sharing a loop with discord.py's gateway
+        # heartbeat; blocking there drops the connection (cf. issue #3).
+        threads = []
+        real_cleanup = orchestrator.cleanup_old_runs
+
+        def recording_cleanup(**kwargs):
+            threads.append(threading.current_thread())
+            return real_cleanup(**kwargs)
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(main, "cleanup_old_runs", recording_cleanup),
+            mock.patch.dict(os.environ, {"RUNS_DIR": tmp}, clear=False),
+        ):
+            asyncio.run(main.on_ready())
+
+        self.assertEqual(len(threads), 1)
+        self.assertNotEqual(threads[0], threading.main_thread())
+
+    def test_a_failed_delete_does_not_stop_on_ready(self):
+        # cleanup_old_runs swallows and logs its own failures, so on_ready
+        # needs no try/except of its own -- this pins that contract rather
+        # than the wrapper it would otherwise tempt someone to add.
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            runs.mkdir()
+            stale = self._stale_job_dir(runs, "job-stale", age_days=90)
+
+            def refusing_rmtree(*args, **kwargs):
+                raise PermissionError(13, "Permission denied", str(stale))
+
+            with (
+                mock.patch.object(orchestrator.shutil, "rmtree", refusing_rmtree),
+                mock.patch.dict(os.environ, {"RUNS_DIR": str(runs)}, clear=False),
+                self.assertLogs("src.orchestrator", level="WARNING"),
+            ):
+                os.environ.pop("RUNS_RETENTION_DAYS", None)
+                # The point: this returns normally rather than raising.
+                asyncio.run(main.on_ready())
+
+            self.assertTrue(stale.exists())
+
+    def test_on_ready_still_announces_the_connection_when_nothing_is_swept(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(os.environ, {"RUNS_DIR": tmp}, clear=False),
+            self.assertLogs("src.main", level="INFO") as captured,
+        ):
+            asyncio.run(main.on_ready())
+
+        self.assertTrue(any("logged in as" in line for line in captured.output))
+        # Nothing was removed, so there is no cleanup line to add noise.
+        self.assertFalse(any("stale run directories" in line for line in captured.output))
