@@ -172,3 +172,20 @@ def test_session_command_unaffected_by_project_config(tmp_path, monkeypatch):
     assert cmd.session_id == "sess-abc123"
     assert cmd.prompt == "계속 진행"
     assert cmd.workdir is None
+
+
+def test_non_utf8_toml_does_not_crash(tmp_path, monkeypatch, caplog):
+    # UnicodeDecodeError is a ValueError, so it is caught by neither OSError
+    # nor TOMLDecodeError. _parse_projects_file promises "Never raises", and
+    # parse() runs on every Discord message -- an escape here means the bot
+    # stops answering anything until the file is fixed by hand.
+    config = tmp_path / "projects.toml"
+    config.write_bytes(b'[book]\ndir = "\xff\xfe\xfa"\nhint = ""\n')
+    monkeypatch.setenv("PROJECTS_FILE", str(config))
+
+    with caplog.at_level(logging.ERROR, logger="src.parser"):
+        cmd = parse("@book 확인해줘")
+
+    assert cmd.workdir is None
+    assert cmd.prompt == "@book 확인해줘"
+    assert any("projects file" in record.message for record in caplog.records)
