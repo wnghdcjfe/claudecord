@@ -11,8 +11,8 @@
 | File | Description |
 |------|-------------|
 | `setup.sh` / `setup.ps1` | `.venv` 생성 후 `pip install -e .`. Windows판은 `py -3` 런처를 우선 시도 |
-| `run_bot.sh` / `run_bot.ps1` | 봇 포그라운드 실행. 루트로 이동 후 `python -m src.main`. `.sh`는 시스템 `python`을, `.ps1`은 `.venv\Scripts\python.exe`를 쓴다 |
-| `check_claude.sh` / `check_claude.ps1` | Claude CLI 연결 진단. `--version` 후 `-p "ping"`으로 왕복 확인. `.ps1`판은 `.env`를 직접 파싱해 `CLAUDE_BIN`을 존중한다 |
+| `run_bot.sh` / `run_bot.ps1` | 봇 포그라운드 실행. `.venv`의 파이썬(`.sh`는 `.venv/bin/python`, `.ps1`은 `.venv\Scripts\python.exe`)으로 `python -m src.main`. `.venv`가 없으면 `scripts/setup`을 안내하며 중단 |
+| `check_claude.sh` / `check_claude.ps1` | Claude CLI 연결 진단. `--version` 후 `-p "ping"`으로 왕복 확인. 둘 다 `.env`를 직접 파싱해 `CLAUDE_BIN`을 존중하고, 없으면 PATH에서 찾는다 |
 | `launchd_load.sh` | macOS LaunchAgent 등록. 인라인 파이썬으로 plist를 만들어 `~/Library/LaunchAgents/`에 쓰고 `launchctl load`. `RunAtLoad` + `KeepAlive`로 상시 구동 |
 | `register_scheduled_task.ps1` | Windows 작업 스케줄러 등록. 로그온 시 기동, 3회 재시작, 로그는 `%LOCALAPPDATA%\discord-claude-assistant\logs\bot.log` |
 | `unregister_scheduled_task.ps1` | 위 작업 해제 |
@@ -23,8 +23,7 @@
 ## For AI Agents
 
 ### Working In This Directory
-- **플랫폼 짝을 맞춰라.** `.sh`의 동작을 바꾸면 대응하는 `.ps1`도 같이 고쳐야 한다. 한쪽만 고치면 조용히 갈라진다.
-- 두 판이 이미 갈라져 있는 지점을 알아둘 것: `run_bot.sh`는 `.venv` 존재를 확인하지 않고 시스템 `python`을 그대로 부르지만, `run_bot.ps1`은 `.venv`를 요구하고 없으면 중단한다. `check_claude.sh`도 `.ps1`과 달리 `CLAUDE_BIN`을 보지 않는다.
+- **플랫폼 짝을 맞춰라.** `.sh`의 동작을 바꾸면 대응하는 `.ps1`도 같이 고쳐야 한다. 한쪽만 고치면 조용히 갈라진다. `run_bot.sh`/`check_claude.sh`가 각각 `.venv` 요구와 `CLAUDE_BIN` 우선순위에서 `.ps1`과 갈라져 있던 것을 #24에서 맞췄다 — 다시 갈라뜨리지 말 것.
 - 셸 스크립트는 `set -euo pipefail`, PowerShell은 `$ErrorActionPreference = "Stop"`으로 시작한다. 새 스크립트도 동일하게.
 - 경로는 스크립트 위치 기준으로 계산한다 (`$(dirname "$0")/..`, `Split-Path -Parent $PSScriptRoot`). 호출자의 cwd에 의존하지 말 것.
 - 에러 메시지는 한국어, 성공 로그는 영어 소문자 한 줄이라는 관행이 있다.

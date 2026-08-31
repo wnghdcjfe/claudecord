@@ -4,7 +4,7 @@
 # tests
 
 ## Purpose
-`src/` 각 모듈에 1:1로 대응하는 `unittest` 기반 테스트 스위트. 총 38개 테스트가 있으며 pytest로 실행한다. Discord Gateway나 Claude CLI 같은 외부 의존성은 전부 `unittest.mock`으로 대체하므로 네트워크·서브프로세스 없이 돈다.
+`src/` 각 모듈에 1:1로 대응하는 `unittest` 기반 테스트 스위트. 총 374개 테스트가 있으며 pytest로 실행한다. Discord Gateway나 Claude CLI 같은 외부 의존성은 전부 `unittest.mock`으로 대체하므로 네트워크·서브프로세스 없이 돈다.
 
 ## Key Files
 
@@ -22,16 +22,15 @@
 ## For AI Agents
 
 ### Working In This Directory
-- `conftest.py`가 **없다.** 그래서 `PYTHONPATH=.` 없이는 `import src.*`가 깨진다.
-- `test_main.py`는 `src.main` → `src.auth` 연쇄 import 때문에 **수집 단계에서** `OWNER_DISCORD_ID`를 요구한다. 환경변수가 없으면 이 파일 하나 때문에 전체 수집이 중단된다.
+- `conftest.py`는 없지만 `pyproject.toml`의 `[tool.pytest.ini_options] pythonpath`가 저장소 루트를 `sys.path`에 넣는다. `PYTHONPATH=.`는 더 이상 필요 없다.
+- **인증 환경변수를 주지 마라.** 환경변수 없이 수집·통과하는 것 자체가 이슈 #9의 회귀 테스트이고, CI도 그렇게 돌린다.
 - 새 테스트는 `unittest.TestCase` 클래스 + `test_` 메서드 스타일을 따른다. pytest 함수 스타일은 아직 쓰이지 않는다.
 - 비동기 코드는 `asyncio.run(scenario())` 패턴으로 감싸 동기 테스트 메서드 안에서 돌린다 (`test_main.py` 참고). `pytest-asyncio`는 쓰지 않는다.
 
 ### Testing Requirements
 ```bash
-PYTHONPATH=. OWNER_DISCORD_ID=1 ALLOWED_CHANNEL_IDS=2 \
-  uv run --with pytest --with discord.py --with python-dotenv pytest -q
-# 기대 결과: 38 passed
+uv run --with pytest --with discord.py --with python-dotenv pytest -q
+# 기대 결과: 374 passed
 ```
 프로젝트 `.venv`에는 pytest가 설치되어 있지 않아 `uv run --with pytest`가 필요하다.
 

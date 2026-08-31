@@ -31,14 +31,14 @@
 
 ### Testing Requirements
 - 모듈 하나당 `tests/test_<module>.py` 하나가 대응한다. 새 모듈을 추가하면 같은 규칙으로 테스트 파일을 만든다.
-- 실행법은 루트 `AGENTS.md`의 Testing Requirements 참고 (`PYTHONPATH=.` + 인증 환경변수 필수).
+- 실행법은 루트 `AGENTS.md`의 Testing Requirements 참고 (환경변수 없이 그냥 돈다).
 - Discord 객체는 `unittest.mock`으로 대체한다. 실제 Gateway 연결을 요구하는 테스트는 없다.
 
 ### Common Patterns
 - **에러는 예외 대신 이벤트 dict로**: `run_claude_stream`은 실패 시에도 예외를 올리지 않고 `{"type": "error", "text": ..., "returncode": ...}`를 yield한다. `main.py`가 `meta.get("type") == "error" or meta.get("is_error")`로 성공/실패를 판정한다.
 - **순수 함수 분리**: `_format_shutdown_reply`, `format_working_status`, `_is_shutdown_command`처럼 I/O 없는 헬퍼로 떼어내 테스트한다.
 - **방어적 역직렬화**: 외부 JSON을 읽는 곳은 타입을 일일이 확인하고 실패 시 기본값으로 되돌아간다 (`sessions._coerce_state`, `orchestrator._read_continuation_workdir`). 단, `sessions._load()`는 예외적으로 손상된 JSON을 처리하지 않는다.
-- **모듈 수준 상수 = 설정**: `SAFE_TOOLS`, `BLOCKED_TOOLS`, `PROJECTS`, `SESSION_TTL_SECONDS`가 모두 하드코딩 상수다. 설정 파일 계층은 아직 없다.
+- **설정은 환경변수 + `projects.toml`**: 프로젝트 태그는 `PROJECTS_FILE`이 가리키는 TOML에서 읽는다(이슈 #16, `projects.example.toml` 참고). `SAFE_TOOLS`/`BLOCKED_TOOLS`/`SESSION_TTL_SECONDS`는 여전히 모듈 상수다 — 앞의 두 개가 왜 보안 경계가 아닌지는 `src/runner.py` 상단 NOTE를 읽을 것.
 
 ## Dependencies
 

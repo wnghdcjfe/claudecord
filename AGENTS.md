@@ -20,7 +20,7 @@ Discord 봇으로 로컬 PC의 Claude Code CLI를 원격 조종하는 파이썬 
 | Directory | Purpose |
 |-----------|---------|
 | `src/` | 봇 애플리케이션 전체 소스 (see `src/AGENTS.md`) |
-| `tests/` | `unittest` 기반 테스트 스위트, 38개 테스트 (see `tests/AGENTS.md`) |
+| `tests/` | `unittest` 기반 테스트 스위트, 374개 테스트 (see `tests/AGENTS.md`) |
 | `scripts/` | macOS(bash)/Windows(PowerShell) 셋업·실행·상시구동 스크립트 (see `scripts/AGENTS.md`) |
 | `examples/` | Claude CLI `stream-json` 이벤트 샘플 (see `examples/AGENTS.md`) |
 | `.omc/` | oh-my-claudecode 런타임 상태. 애플리케이션과 무관하며 커밋 대상이 아님 |
@@ -28,22 +28,24 @@ Discord 봇으로 로컬 PC의 Claude Code CLI를 원격 조종하는 파이썬 
 ## For AI Agents
 
 ### Working In This Directory
-- 이 저장소에는 `bot.py`도 `requirements.txt`도 **없다**. README가 언급하더라도 믿지 말 것. 실제 진입점은 `src/main.py`이고, 실행은 `python -m src.main` 또는 `scripts/run_bot.sh`다.
+- 진입점은 `src/main.py`이고, 실행은 `python -m src.main` 또는 `scripts/run_bot.sh`다. 이 저장소에는 `bot.py`도 `requirements.txt`도 없다 (README가 그 둘을 안내하던 것은 이슈 #10에서 고쳤다).
 - 설치는 `pip install -e .` (= `scripts/setup.sh`). 의존성은 `pyproject.toml`이 단일 진실 원천이다.
 - 사용자 대면 문자열은 전부 한국어다. 새 메시지를 추가할 때 같은 톤(존댓말, 간결한 상태 문구)을 유지할 것.
 
 ### Testing Requirements
-테스트는 **환경 설정 없이는 수집조차 실패한다.** 두 가지가 모두 필요하다:
+환경변수 없이 그냥 돈다. `pyproject.toml`의 `[tool.pytest.ini_options]`가 `pythonpath`를 잡고
+(이슈 #8), `src/auth.py`는 import가 아니라 `ensure_configured()` 호출 시점에 검증한다(이슈 #9).
 
 ```bash
-PYTHONPATH=. OWNER_DISCORD_ID=1 ALLOWED_CHANNEL_IDS=2 \
-  uv run --with pytest --with discord.py --with python-dotenv pytest -q
+uv run --with pytest --with discord.py --with python-dotenv pytest -q
+# 기대 결과: 374 passed
 ```
 
-- `PYTHONPATH=.` — `[tool.pytest.ini_options]`도 `conftest.py`도 없어서 `import src.*`가 해석되지 않는다.
-- `OWNER_DISCORD_ID` / `ALLOWED_CHANNEL_IDS` — `src/auth.py`가 **import 시점에** 환경변수를 검증하므로, 없으면 `tests/test_main.py` 수집 단계에서 `RuntimeError`가 난다.
+인증 환경변수를 **일부러 주지 않는 것**이 이슈 #9의 회귀 테스트다. CI(`.github/workflows/ci.yml`)도
+같은 이유로 환경변수 없이 돌린다. 프로젝트 `.venv`에는 pytest가 없으므로 `--with pytest`가 필요하다
+(또는 `uv sync --group dev` 후 `uv run pytest`).
 
-린트는 `uvx ruff check .` 이며 현재 23건이 남아 있다(원래 초록이 아님). 새로 건드린 파일이 기존보다 더 나빠지지 않는 선을 기준으로 삼을 것.
+린트는 `uv run ruff check .`이며 `pyproject.toml`의 `[tool.ruff]`가 기준선이다(이슈 #21). 초록이어야 한다.
 
 ### Common Patterns
 - 모듈은 얇은 단일 책임 단위로 나뉘고, `src/main.py`가 이들을 조립한다.
