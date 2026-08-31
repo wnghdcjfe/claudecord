@@ -1,26 +1,47 @@
 import asyncio
+import contextlib
 import json
 import os
-import signal
 import shutil
+import signal
 import subprocess
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
 
 from src.timing import SPAN_FIRST_EVENT, SPAN_SPAWN, JobTimings
 from src.warm_pool import WarmClaudePool, WarmKey, WarmProcess, warm_enabled
 
-# NOTE: --permission-mode bypassPermissions is intentionally kept (see team-plan
-# handoff, Rejected). Empirically verified (2026-08-30) that --disallowedTools
-# is still enforced even under bypassPermissions: running
-# `claude -p --permission-mode bypassPermissions --disallowedTools='Bash(rm:*)'
-# --output-format stream-json --verbose -- "<prompt asking the model to rm a
-# file>"` produced a stream-json `permission_denied` system event and a
-# `tool_result` with `is_error: true` ("Permission to use Bash ... has been
-# denied."). So SAFE_TOOLS/BLOCKED_TOOLS below are a real, effective boundary,
-# not a no-op under this permission mode.
+# NOTE: --permission-mode bypassPermissions is intentionally kept, but read
+# this before treating the two tool lists below as a security boundary. They
+# are not one. Measured against Claude Code 2.1.251 (issue #11); an earlier
+# version of this comment drew the opposite conclusion from the first finding
+# alone, so the limits are spelled out here rather than left to inference.
+#
+#   BLOCKED_TOOLS *is* enforced under bypassPermissions. `rm foo`,
+#   `curl --version` and `echo hi && rm foo` all produce a `permission_denied`
+#   system event and an `is_error: true` tool_result -- the CLI parses
+#   `&&`-joined subcommands (decision_reason_type: subcommandResults). It
+#   genuinely stops an accidental `rm`, which is the most likely way this bot
+#   destroys something.
+#
+#   But it matches on the command's leading string. `/bin/rm foo` and
+#   `python3 -c "import os; os.remove('foo')"` both ran and both deleted the
+#   file. This is a guardrail against mistakes, not a barrier against intent.
+#
+#   SAFE_TOOLS has no effect here at all. --allowedTools is a pre-approval
+#   list ("don't ask about these"), and bypassPermissions already approves
+#   everything, so the session keeps all builtin tools -- Bash, WebFetch,
+#   WebSearch, Task included. The `init` event reports 28 of them, not the 11
+#   named below. Under the *default* permission mode the same flag does gate
+#   mutating Bash commands, which is why it is kept rather than deleted.
+#
+#   What bypassPermissions actually switches off is the filesystem write
+#   sandbox: writes outside cwd and outside every --add-dir path succeed with
+#   no permission_denied event. The default mode refuses them.
+#
+# The real boundary is src/auth.py (owner + channel allowlist). README's
+# "보안 모델" section states this for users.
 
 DEFAULT_CLAUDE_MODEL = "sonnet"
 DEFAULT_STREAM_LIMIT_BYTES = 8 * 1024 * 1024  # 8MiB
@@ -117,7 +138,7 @@ async def _wait_for_process_exit(
 ) -> bool:
     try:
         await asyncio.wait_for(proc.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return False
     except ProcessLookupError:
         return True
@@ -208,16 +229,20 @@ async def _terminate_processes(
     requested = len(processes)
 
     for proc in processes:
-        try:
+        # Already gone between the caller's snapshot and now -- that is the
+        # outcome we wanted anyway.
+        with contextlib.suppress(ProcessLookupError):
             _terminate_process(proc)
-        except ProcessLookupError:
-            pass
 
     exited = await asyncio.gather(
         *(_wait_for_process_exit(proc, timeout) for proc in processes),
         return_exceptions=False,
     )
-    stubborn = [proc for proc, did_exit in zip(processes, exited) if not did_exit]
+    # strict=True: `exited` is gather() over `processes`, so a length
+    # mismatch would mean a logic error, not a short input.
+    stubborn = [
+        proc for proc, did_exit in zip(processes, exited, strict=True) if not did_exit
+    ]
 
     killed = 0
     for proc in stubborn:

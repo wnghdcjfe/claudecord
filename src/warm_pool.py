@@ -29,6 +29,7 @@ fresh, otherwise it would inherit the previous conversation's context.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -169,7 +170,7 @@ class WarmProcess:
             return
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except (TimeoutError, asyncio.CancelledError):
             return
 
     # -- turn I/O -------------------------------------------------------
@@ -213,10 +214,10 @@ class WarmProcess:
         stdin = self.proc.stdin
         if stdin is None:
             return
-        try:
+        # Best-effort: the pipe may already be torn down (OSError) or the
+        # loop gone (RuntimeError), and either way stdin is closed enough.
+        with contextlib.suppress(OSError, RuntimeError):
             stdin.close()
-        except (OSError, RuntimeError):
-            pass
 
     # -- expiry bookkeeping ---------------------------------------------
 
