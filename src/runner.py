@@ -180,18 +180,51 @@ async def _wait_for_process_exit(
     return proc.returncode is not None
 
 
+def _kill_windows_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """The Windows stand-in for the POSIX branch's killpg.
+
+    ``proc.terminate()`` calls TerminateProcess on the process we spawned and
+    on nothing else. On Windows that process is usually ``cmd.exe``, because
+    the npm-installed CLI is ``claude.cmd`` and ``_wrap_windows_batch_command``
+    runs it through the shell -- so terminating it leaves the node process it
+    started alive, still holding the model session and the stdout pipe we stop
+    reading from. ``taskkill /T`` walks the child tree instead.
+
+    There is no gentle half of this. A console process with no message loop
+    cannot be *asked* to close, so ``taskkill`` without ``/F`` refuses with
+    "can only be terminated forcefully" and the tree survives -- which means
+    both the terminate and the kill step force, and the escalation in
+    ``_terminate_processes`` finishes at its first step rather than waiting out
+    the timeout for a signal that can never arrive.
+    """
+    completed = subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        check=False,
+    )
+    if completed.returncode == 0:
+        return
+    # taskkill declines for reasons that are not all failures -- the process
+    # exited between the snapshot and now (128), access denied, taskkill absent
+    # from a stripped image. Fall back to the direct child, which is all this
+    # did before; leaving the tree alone would be strictly worse.
+    proc.kill()
+
+
 def _terminate_process(proc: asyncio.subprocess.Process) -> None:
     if os.name != "nt":
         os.killpg(proc.pid, signal.SIGTERM)
         return
-    proc.terminate()
+    _kill_windows_process_tree(proc)
 
 
 def _kill_process(proc: asyncio.subprocess.Process) -> None:
     if os.name != "nt":
         os.killpg(proc.pid, signal.SIGKILL)
         return
-    proc.kill()
+    _kill_windows_process_tree(proc)
 
 
 async def _cleanup_runaway_process(

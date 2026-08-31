@@ -1001,7 +1001,14 @@ class PathRedactionTests(unittest.TestCase):
                 return stream_log, gone
 
         stream_log, gone = asyncio.run(scenario())
-        self.assertIn(str(gone), stream_log)
+        # Decode before looking: the log is JSON, so on Windows every separator
+        # in the path is written as an escaped `\\` and a literal substring
+        # search for the path finds nothing even though it is all there.
+        logged = [json.loads(line) for line in stream_log.splitlines() if line.strip()]
+        self.assertTrue(
+            any(str(gone) in event.get("text", "") for event in logged),
+            f"full path missing from the stream log: {logged}",
+        )
 
     def test_run_job_missing_claude_cwd_on_event_receives_redacted_text(self):
         async def scenario():

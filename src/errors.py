@@ -45,7 +45,11 @@ MAX_ERROR_CHARS = 400
 #             then published the account name as `.../jane`.
 #             winhome precedes posixhome so `C:/Users/jane/x` -- a Windows path
 #             spelled with forward slashes, which Python echoes back verbatim --
-#             is not mistaken for a POSIX one.
+#             is not mistaken for a POSIX one. Its drive letter is optional
+#             because a drive-relative path leaks the same account name: on
+#             Windows, opening `/Users/jane/x` fails with the drive dropped and
+#             the separators flipped, so the OSError reads `\Users\jane\x` --
+#             which posixhome and abspath, both forward-slash only, walk past.
 #   abspath   any other absolute path: the directories above the last segment
 #             describe the machine rather than the failure. The lookbehind
 #             keeps it off paths an earlier rule already anchored, so `~/a/b`
@@ -53,9 +57,16 @@ MAX_ERROR_CHARS = 400
 #             the same one character later, for the `file://~/a/b` a previous
 #             pass produced. Idempotence matters because orchestrator.py
 #             redacts when it raises and main.py redacts again when it sends.
+# One separator, as it can actually reach this function. `str(OSError)` renders
+# the filename with `repr()`, which escapes backslashes -- so the text handed to
+# `redact_paths` spells a Windows path `C:\\Users\\jane`, doubled, and a pattern
+# that only knows the single form walks straight past the account name in it.
+# Deliberately not `[\\/]{1,2}`, which would also swallow the `//` in a URL.
+_SEP = r"(?:\\\\|[\\/])"
+
 _REDACT = re.compile(
     r"(?P<url>(?<![A-Za-z0-9+.\-])(?![Ff][Ii][Ll][Ee]:)[A-Za-z][A-Za-z0-9+.\-]*://[^\s?#]*)"
-    r"|(?P<winhome>[A-Za-z]:[\\/]Users[\\/][^\\/\s]+(?:[\\/]\S*)?)"
+    rf"|(?P<winhome>(?:[A-Za-z]:)?{_SEP}Users{_SEP}[^\\/\s]+(?:[\\/]\S*)?)"
     r"|(?P<posixhome>/(?:Users|home)/[^/\s]+(?:/\S*)?)"
     r"|(?P<abspath>(?<![~\w.])/(?!~/)(?:[^/\s]+/)+[^/\s]*)"
 )
@@ -69,7 +80,7 @@ def _replace(match: re.Match[str]) -> str:
     if windows is not None:
         # Drop `<drive>:<sep>Users<sep><account>`, keep the tail as typed so the
         # separator style the reader saw is the one they get back.
-        tail = re.sub(r"^[A-Za-z]:[\\/]Users[\\/][^\\/\s]+", "", windows)
+        tail = re.sub(rf"^(?:[A-Za-z]:)?{_SEP}Users{_SEP}[^\\/\s]+", "", windows)
         return "~" + tail
 
     posix = match.group("posixhome")
