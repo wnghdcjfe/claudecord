@@ -157,7 +157,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("stream-json", cmd)
         self.assertIn("--setting-sources", cmd)
         self.assertIn("local", cmd)
-        self.assertTrue(any(item.startswith("--allowedTools=") for item in cmd))
+        self.assertIn("--tools", cmd)
         self.assertTrue(any(item.startswith("--disallowedTools=") for item in cmd))
         self.assertIn("--permission-mode", cmd)
         self.assertIn("bypassPermissions", cmd)
@@ -169,6 +169,55 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("--max-turns", cmd)
         self.assertNotIn("--max-budget-usd", cmd)
         self.assertEqual(cmd[-1], "hello")
+
+    def test_the_tool_set_is_passed_as_tools_not_allowedtools(self):
+        # --allowedTools is a pre-approval list, and under bypassPermissions
+        # everything is already approved -- it restricted nothing, which is
+        # what issue #11 measured. --tools is the flag that actually replaces
+        # the session's tool set, so passing the old one is a silent no-op.
+        cmd = build_claude_command("hello", resume=None, system_hint=None, extra_dirs=[])
+
+        self.assertFalse(any(item.startswith("--allowedTools") for item in cmd))
+        self.assertEqual(runner.ALLOWED_TOOLS, cmd[cmd.index("--tools") + 1])
+
+    def test_the_tool_set_covers_what_the_job_prompt_asks_for(self):
+        # orchestrator's rule block tells the model to edit sources, write
+        # artifacts and meta.json, and the README's examples are shell work.
+        # Dropping any of these turns a normal request into a dead end.
+        tools = runner.ALLOWED_TOOLS.split(",")
+
+        for required in ("Read", "Edit", "Write", "Glob", "Grep", "Bash"):
+            self.assertIn(required, tools)
+
+    def test_the_tool_set_omits_the_agent_infrastructure(self):
+        # Team, scheduling and worktree tooling this bot never reaches for.
+        # Task is out too: without TaskOutput/TaskStop/Monitor there is no
+        # verified way to end a background subagent it starts.
+        tools = runner.ALLOWED_TOOLS.split(",")
+
+        for absent in (
+            "Task",
+            "TaskOutput",
+            "TaskStop",
+            "Monitor",
+            "Workflow",
+            "SendMessage",
+            "CronCreate",
+            "ScheduleWakeup",
+            "RemoteTrigger",
+            "EnterWorktree",
+            "ToolSearch",
+        ):
+            self.assertNotIn(absent, tools)
+
+    def test_web_access_is_kept(self):
+        # A deliberate choice, not an oversight: "summarise this link" is a
+        # normal request. It is not a containment boundary either way -- Bash
+        # is in the list, so the network stays reachable regardless.
+        tools = runner.ALLOWED_TOOLS.split(",")
+
+        self.assertIn("WebFetch", tools)
+        self.assertIn("WebSearch", tools)
 
     def test_build_claude_command_defaults_model_to_sonnet(self):
         env = dict(os.environ)

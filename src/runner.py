@@ -29,12 +29,27 @@ from src.warm_pool import WarmClaudePool, WarmKey, WarmProcess, warm_enabled
 #   `python3 -c "import os; os.remove('foo')"` both ran and both deleted the
 #   file. This is a guardrail against mistakes, not a barrier against intent.
 #
-#   SAFE_TOOLS has no effect here at all. --allowedTools is a pre-approval
-#   list ("don't ask about these"), and bypassPermissions already approves
-#   everything, so the session keeps all builtin tools -- Bash, WebFetch,
-#   WebSearch, Task included. The `init` event reports 28 of them, not the 11
-#   named below. Under the *default* permission mode the same flag does gate
-#   mutating Bash commands, which is why it is kept rather than deleted.
+#   --allowedTools had no effect here at all, which is why it is gone. It is a
+#   pre-approval list ("don't ask about these"), and bypassPermissions already
+#   approves everything, so the session kept all 28 builtin tools rather than
+#   the 11 that flag named -- a constant called SAFE_TOOLS that restricted
+#   nothing. --tools does restrict, so ALLOWED_TOOLS below replaces it: a tool
+#   left out is absent from the model's schema, and prompting for one produces
+#   no call rather than a refused one. That is a smaller reachable surface,
+#   still not a sandbox, because Bash is in the list.
+#
+#   Do not read the removal as "--allowedTools is a useless flag". Under the
+#   *default* permission mode it is a real gate: with it, a mutating Bash
+#   command runs only if the list names it, and `touch` was refused until
+#   `Bash(touch:*)` was added. It is inert here only because bypassPermissions
+#   has already granted what it would pre-approve. Anyone revisiting the
+#   permission mode wants it back.
+#
+#   The two flags are independent layers, not one path: --tools decides which
+#   tools exist, --disallowedTools decides which calls to an existing tool are
+#   allowed. Verified together -- with WebFetch present in --tools,
+#   `Bash(curl:*)` is still refused, and `rm foo` and `echo hi && rm foo` still
+#   raise permission_denied with the same decision_reason_type as before.
 #
 #   What bypassPermissions actually switches off is the filesystem write
 #   sandbox: writes outside cwd and outside every --add-dir path succeed with
@@ -59,19 +74,40 @@ CLAUDE_PERMISSION_MODE = "bypassPermissions"
 # that lacks access to the new job directory.
 WARM_KEY_IGNORES_EXTRA_DIRS = CLAUDE_PERMISSION_MODE == "bypassPermissions"
 
-SAFE_TOOLS = ",".join(
+# Passed as --tools, which unlike --allowedTools actually replaces the tool set
+# the session gets (issue #11). Anything omitted here is genuinely absent: the
+# model is not told it exists, and asking it to reach one anyway produces no
+# tool call at all. Two rules decided the contents.
+#
+# Kept because the bot's own prompt asks for them: it edits sources in the
+# working directory, writes artifacts and meta.json into the job directory, and
+# searches for files. Bash stays because "make a folder on my Desktop" and
+# "shift the subtitles" -- the README's own examples -- are shell work, and
+# narrowing it would turn this from a general assistant into a coding one.
+# WebFetch/WebSearch stay because reading a link is a normal thing to ask for.
+#
+# Dropped because this bot never uses them: the agent-team, scheduling and
+# worktree machinery (Task, TaskOutput, TaskStop, Monitor, Workflow, ListAgents,
+# SendMessage, Cron*, ScheduleWakeup, RemoteTrigger, PushNotification,
+# EnterWorktree, ExitWorktree, DesignSync, ReportFindings, Skill, ToolSearch).
+# Task goes rather than staying without its companions: keeping it while
+# TaskOutput/TaskStop/Monitor are gone leaves no verified way to end a
+# background subagent.
+#
+# This shrinks what the session can reach. It is not an escape boundary --
+# Bash remains, so `python3 -c "import urllib.request"` reaches the network
+# whether or not WebFetch is in the list. See the NOTE at the top.
+ALLOWED_TOOLS = ",".join(
     [
         "Read",
         "Edit",
         "Write",
+        "NotebookEdit",
         "Glob",
         "Grep",
-        "Bash(git status:*)",
-        "Bash(git log:*)",
-        "Bash(git diff:*)",
-        "Bash(npm test:*)",
-        "Bash(pytest:*)",
-        "Bash(uv run:*)",
+        "Bash",
+        "WebFetch",
+        "WebSearch",
     ]
 )
 
@@ -363,7 +399,8 @@ def build_claude_command(
         _resolve_claude_model(),
         "--permission-mode",
         CLAUDE_PERMISSION_MODE,
-        f"--allowedTools={SAFE_TOOLS}",
+        "--tools",
+        ALLOWED_TOOLS,
         f"--disallowedTools={BLOCKED_TOOLS}",
     ]
 
