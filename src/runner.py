@@ -7,7 +7,6 @@ import signal
 import subprocess
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass
-from pathlib import Path
 
 from src.timing import SPAN_FIRST_EVENT, SPAN_SPAWN, JobTimings
 from src.warm_pool import WarmClaudePool, WarmKey, WarmProcess, warm_enabled
@@ -314,7 +313,10 @@ async def _terminate_processes(
 def _resolve_claude_executable() -> str:
     configured = os.environ.get("CLAUDE_BIN")
     if configured:
-        return str(Path(configured).expanduser())
+        # os.path, not pathlib: Path() dispatches on os.name, and on 3.11
+        # constructing the other platform's flavour raises NotImplementedError.
+        # Both of these only ever needed string manipulation.
+        return os.path.expanduser(configured)
 
     candidates = ["claude"]
     if os.name == "nt":
@@ -347,7 +349,7 @@ def _wrap_windows_batch_command(cmd: list[str]) -> list[str]:
     if os.name != "nt":
         return cmd
 
-    suffix = Path(cmd[0]).suffix.lower()
+    suffix = os.path.splitext(cmd[0])[1].lower()
     if suffix not in WINDOWS_BATCH_EXTENSIONS:
         return cmd
 
