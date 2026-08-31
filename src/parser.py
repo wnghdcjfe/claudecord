@@ -30,7 +30,10 @@ def _parse_projects_file(path: Path) -> dict[str, tuple[str, str]]:
     try:
         with path.open("rb") as f:
             data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError is a ValueError, so neither of the other two
+        # catches it. parse() runs on every message, so letting it escape
+        # would stop the bot from answering anything at all.
         logger.error("could not read projects file %s: %s", path, exc)
         return {}
 
