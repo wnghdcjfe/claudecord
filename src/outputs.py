@@ -415,7 +415,13 @@ def _run_cairosvg(svg_path: Path, preview_path: Path) -> bool:
     runtime dependency just to send Discord messages (#20)."""
     try:
         import cairosvg
-    except ImportError:
+    except Exception:
+        # Not just ImportError: cairosvg pulls in cairocffi, which dlopens
+        # libcairo at import time and raises OSError when the system library
+        # is missing -- the exact state you land in after `pip install
+        # cairosvg` with no system cairo. Letting that escape kills the whole
+        # send_outputs call, so the job reports success with no attachments.
+        logger.debug("cairosvg is unavailable", exc_info=True)
         return False
     try:
         cairosvg.svg2png(url=str(svg_path), write_to=str(preview_path), output_width=SVG_PREVIEW_SIZE)
