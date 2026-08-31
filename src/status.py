@@ -1,32 +1,155 @@
 import asyncio
+import logging
+import os
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import discord
 
+logger = logging.getLogger(__name__)
+
 WORKING_MESSAGE = "작업중입니다."
+QUEUED_MESSAGE = "대기 중"
 WORKING_GIF_PATH = Path(__file__).resolve().parents[1] / "working_m.gif"
 WORKING_GIF_FILENAME = "working_m.gif"
-SPINNER_INTERVAL_SECONDS = 1.2
-STATUS_FRAMES = (
-    ("⚙️", "▰▱▱▱▱", "요청을 정리하는 중"),
-    ("🛠️", "▰▰▱▱▱", "작업을 수행하는 중"),
-    ("🔧", "▰▰▰▱▱", "결과를 다듬는 중"),
-    ("🚧", "▰▰▰▰▱", "꼼꼼히 확인하는 중"),
-    ("✨", "▰▰▰▰▰", "마무리하는 중"),
+
+# Uploading working_m.gif (192KB) on every ack delayed the very first Discord
+# response. The GIF is now opt-in only, via WORKING_GIF=1/true; the default
+# ack is text-only and goes out immediately.
+WORKING_GIF_ENV_VAR = "WORKING_GIF"
+WORKING_GIF_TRUTHY_VALUES = {"1", "true", "yes", "on"}
+
+# Discord's message-edit route allows ~5 edits per 5 seconds before an
+# edit queues behind the rate-limit bucket (risking the final "완료" edit
+# arriving late). 2.5s keeps us at 0.4 edits/sec, well under that 1/sec
+# ceiling.
+EDIT_INTERVAL_SECONDS = 2.5
+DISCORD_EDIT_RATE_LIMIT_PER_SECOND = 1.0  # 5 edits / 5 seconds
+
+# Fallback labels keyed by minimum elapsed seconds, used only until we learn
+# a real tool name or turn count from the stream. Unlike the old animation,
+# these are driven by the wall clock (time.monotonic()), not a looping index.
+STAGE_LABELS: tuple[tuple[float, str], ...] = (
+    (0, "요청을 정리하는 중"),
+    (5, "작업을 수행하는 중"),
+    (20, "꼼꼼히 확인하는 중"),
+    (60, "마무리하는 중"),
 )
 
 
+def _working_gif_enabled() -> bool:
+    raw = os.environ.get(WORKING_GIF_ENV_VAR, "")
+    return raw.strip().lower() in WORKING_GIF_TRUTHY_VALUES
+
+
 def make_working_gif_file() -> discord.File | None:
+    if not _working_gif_enabled():
+        return None
     if not WORKING_GIF_PATH.is_file():
         return None
     return discord.File(WORKING_GIF_PATH, filename=WORKING_GIF_FILENAME)
 
 
-def format_working_status(job_name: str, frame_index: int = 0) -> str:
-    icon, activity_bar, activity_label = STATUS_FRAMES[frame_index % len(STATUS_FRAMES)]
+@dataclass
+class JobProgress:
+    """Shared, mutable progress state for one job.
+
+    ``record_event`` is handed straight to ``run_job(..., on_event=...)``, so
+    each stream event updates this object the moment the orchestrator sees it;
+    a renderer (``run_spinning_loader`` / ``format_working_status``) reads it.
+
+    Issue #3: this used to be filled by a background tailer that polled
+    ``<job_dir>/logs/stream.jsonl`` every 0.5s -- i.e. run_job wrote an event
+    it already held in memory to disk purely so another task could parse it
+    back out. That round-trip is gone: it delayed progress by up to a poll
+    interval and required a pile of partial-read defenses for the multi-byte
+    truncation a concurrent writer causes. stream.jsonl remains, as a
+    debugging artifact only.
+    """
+
+    started_at: float = field(default_factory=time.monotonic)
+    turn: int = 0
+    tool: str | None = None
+    event_type: str | None = None
+
+    def elapsed_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self.started_at)
+
+    def record_event(self, event: dict) -> None:
+        if not isinstance(event, dict):
+            return
+
+        event_type = event.get("type")
+        if event_type:
+            self.event_type = str(event_type)
+
+        if event_type == "assistant":
+            self.turn += 1
+            for block in _content_blocks(event):
+                if block.get("type") == "tool_use":
+                    name = block.get("name")
+                    if name:
+                        self.tool = str(name)
+        elif event_type in {"user", "result", "error"}:
+            # A tool result (or the job ending) means no tool is in flight.
+            self.tool = None
+
+
+def _content_blocks(event: dict) -> list[dict]:
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def _stage_label(elapsed: float) -> str:
+    label = STAGE_LABELS[0][1]
+    for threshold, text in STAGE_LABELS:
+        if elapsed >= threshold:
+            label = text
+    return label
+
+
+def _format_elapsed(elapsed: float) -> str:
+    total_seconds = int(elapsed)
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _activity_label(progress: "JobProgress | None") -> str:
+    if progress is None:
+        return STAGE_LABELS[0][1]
+    if progress.tool:
+        return f"{progress.tool} 도구 실행 중"
+    if progress.turn > 0:
+        return f"{progress.turn}번째 턴 진행 중"
+    return _stage_label(progress.elapsed_seconds())
+
+
+def format_working_status(job_name: str, progress: "JobProgress | None" = None) -> str:
+    elapsed = progress.elapsed_seconds() if progress else 0.0
     return (
-        f"{icon} **{WORKING_MESSAGE}**\n"
-        f"{activity_bar} {activity_label}\n"
+        f"⚙️ **{WORKING_MESSAGE}**\n"
+        f"{_activity_label(progress)} · 경과 {_format_elapsed(elapsed)}\n"
+        f"`{job_name}`"
+    )
+
+
+def format_queued_status(job_name: str, ahead: int) -> str:
+    """Ack text for a job that is waiting on the MAX_CONCURRENT_JOBS gate.
+
+    Issue #6: without this the user saw the normal "작업중입니다" while
+    nothing had actually started, and every queued job silently slowed the
+    running ones down. ``ahead`` counts the jobs already holding or waiting
+    for a slot when this one arrived.
+    """
+    return (
+        f"⏳ **{QUEUED_MESSAGE} (앞에 {max(0, ahead)}건)**\n"
+        f"앞선 작업이 끝나면 바로 시작합니다\n"
         f"`{job_name}`"
     )
 
@@ -34,17 +157,22 @@ def format_working_status(job_name: str, frame_index: int = 0) -> str:
 async def run_spinning_loader(
     message: discord.Message,
     job_name: str,
+    progress: "JobProgress | None" = None,
     *,
-    interval: float = SPINNER_INTERVAL_SECONDS,
+    interval: float = EDIT_INTERVAL_SECONDS,
 ) -> None:
-    frame_index = 1
     while True:
         await asyncio.sleep(interval)
         try:
-            await message.edit(content=format_working_status(job_name, frame_index))
-        except discord.DiscordException:
+            await message.edit(content=format_working_status(job_name, progress))
+        except (discord.DiscordException, OSError):
+            # Message gone / permissions changed (DiscordException), or a
+            # transient network hiccup such as aiohttp.ClientOSError (an
+            # OSError subclass). The loader is best-effort UI, so bail out
+            # quietly rather than dying with an exception that would
+            # otherwise surface when the caller awaits this task.
+            logger.warning("run_spinning_loader: edit failed, stopping loader", exc_info=True)
             return
-        frame_index = (frame_index + 1) % len(STATUS_FRAMES)
 
 
 async def stop_spinning_loader(task: asyncio.Task[None]) -> None:
@@ -53,3 +181,8 @@ async def stop_spinning_loader(task: asyncio.Task[None]) -> None:
         await task
     except asyncio.CancelledError:
         pass
+    except Exception:
+        # A background status task must never take the caller down with it --
+        # log for debuggability and swallow so the real job result (e.g.
+        # send_outputs) still gets delivered.
+        logger.exception("Background status task ended with an unexpected error")
