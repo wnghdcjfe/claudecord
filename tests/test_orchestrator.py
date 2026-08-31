@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -92,9 +94,11 @@ class OrchestratorTests(unittest.TestCase):
     def test_create_job_rejects_missing_target_workdir(self):
         with tempfile.TemporaryDirectory() as runs:
             missing = Path(runs) / "missing"
-            with mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False):
-                with self.assertRaises(ValueError):
-                    orchestrator.create_job("테스트", str(missing), None)
+            with (
+                mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False),
+                self.assertRaises(ValueError),
+            ):
+                orchestrator.create_job("테스트", str(missing), None)
 
     def test_run_job_uses_persisted_target_workdir(self):
         async def scenario():
@@ -690,3 +694,331 @@ class StreamWriterTests(unittest.TestCase):
         open_calls, lines = asyncio.run(scenario())
         self.assertEqual(len(open_calls), 1)
         self.assertEqual(len(lines), 11)
+
+
+def _seed_job_dir(runs_dir: Path, *, created_at: datetime) -> Path:
+    """Create a real job dir (via create_job) under runs_dir, then stamp its
+    job.json created_at so cleanup_old_runs' age math is deterministic
+    instead of depending on wall-clock sleeps or filesystem mtime quirks."""
+    with (
+        tempfile.TemporaryDirectory() as project,
+        mock.patch.dict(os.environ, {"RUNS_DIR": str(runs_dir)}, clear=False),
+    ):
+        job_dir = orchestrator.create_job("테스트", project, None)
+
+    meta_path = job_dir / orchestrator.JOB_META
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["created_at"] = created_at.isoformat()
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return job_dir
+
+
+class RunsRetentionDaysParsingTests(unittest.TestCase):
+    """Issue #22: RUNS_RETENTION_DAYS parsing rules, isolated from the
+    filesystem side of cleanup_old_runs."""
+
+    def test_unset_env_var_uses_default(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(orchestrator.RUNS_RETENTION_DAYS_ENV_VAR, None)
+            self.assertEqual(
+                orchestrator._runs_retention_days(),
+                orchestrator.DEFAULT_RUNS_RETENTION_DAYS,
+            )
+
+    def test_empty_string_disables_cleanup(self):
+        with mock.patch.dict(
+            os.environ, {orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: ""}, clear=False
+        ):
+            self.assertIsNone(orchestrator._runs_retention_days())
+
+    def test_zero_disables_cleanup(self):
+        with mock.patch.dict(
+            os.environ, {orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "0"}, clear=False
+        ):
+            self.assertIsNone(orchestrator._runs_retention_days())
+
+    def test_valid_positive_value_is_used(self):
+        with mock.patch.dict(
+            os.environ, {orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "7"}, clear=False
+        ):
+            self.assertEqual(orchestrator._runs_retention_days(), 7)
+
+    def test_non_integer_value_falls_back_to_default(self):
+        with mock.patch.dict(
+            os.environ, {orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "abc"}, clear=False
+        ):
+            with self.assertLogs("src.orchestrator", level="WARNING"):
+                value = orchestrator._runs_retention_days()
+            self.assertEqual(value, orchestrator.DEFAULT_RUNS_RETENTION_DAYS)
+
+    def test_negative_value_falls_back_to_default(self):
+        with mock.patch.dict(
+            os.environ, {orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "-5"}, clear=False
+        ):
+            with self.assertLogs("src.orchestrator", level="WARNING"):
+                value = orchestrator._runs_retention_days()
+            self.assertEqual(value, orchestrator.DEFAULT_RUNS_RETENTION_DAYS)
+
+
+class CleanupOldRunsTests(unittest.TestCase):
+    """Issue #22: retention cleanup, driven entirely through
+    tempfile.TemporaryDirectory + monkeypatched RUNS_DIR -- never touches the
+    real ~/.claudecord."""
+
+    def test_old_job_dir_is_removed_recent_is_kept(self):
+        now = datetime(2026, 8, 31, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as runs:
+            old_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=40))
+            recent_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=5))
+
+            with mock.patch.dict(
+                os.environ,
+                {"RUNS_DIR": runs, orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "30"},
+                clear=False,
+            ):
+                removed = orchestrator.cleanup_old_runs(now=now)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(old_dir.exists())
+            self.assertTrue(recent_dir.exists())
+
+    def test_zero_retention_disables_cleanup_entirely(self):
+        now = datetime(2026, 8, 31, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as runs:
+            ancient_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=9999))
+
+            with mock.patch.dict(
+                os.environ,
+                {"RUNS_DIR": runs, orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "0"},
+                clear=False,
+            ):
+                removed = orchestrator.cleanup_old_runs(now=now)
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(ancient_dir.exists())
+
+    def test_blank_retention_disables_cleanup_entirely(self):
+        now = datetime(2026, 8, 31, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as runs:
+            ancient_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=9999))
+
+            with mock.patch.dict(
+                os.environ,
+                {"RUNS_DIR": runs, orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: ""},
+                clear=False,
+            ):
+                removed = orchestrator.cleanup_old_runs(now=now)
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(ancient_dir.exists())
+
+    def test_invalid_retention_falls_back_to_default_and_still_cleans_very_old_dirs(self):
+        now = datetime(2026, 8, 31, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as runs:
+            ancient_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=9999))
+            recent_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=1))
+
+            with mock.patch.dict(
+                os.environ,
+                {"RUNS_DIR": runs, orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "not-a-number"},
+                clear=False,
+            ):
+                removed = orchestrator.cleanup_old_runs(now=now)
+
+            # A malformed value falls back to DEFAULT_RUNS_RETENTION_DAYS (30
+            # days), not to "disabled" -- a 9999-day-old dir is still well
+            # past that default, so it must still go.
+            self.assertEqual(removed, 1)
+            self.assertFalse(ancient_dir.exists())
+            self.assertTrue(recent_dir.exists())
+
+    def test_missing_runs_dir_returns_zero_without_error(self):
+        with tempfile.TemporaryDirectory() as runs:
+            missing = Path(runs) / "does-not-exist"
+            with mock.patch.dict(os.environ, {"RUNS_DIR": str(missing)}, clear=False):
+                removed = orchestrator.cleanup_old_runs()
+            self.assertEqual(removed, 0)
+
+    def test_non_job_prefixed_entries_are_left_alone(self):
+        now = datetime(2026, 8, 31, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as runs:
+            stray_dir = Path(runs) / "not-a-job-dir"
+            stray_dir.mkdir()
+            stray_file = Path(runs) / "job-looks-like-one-but-is-a-file"
+            stray_file.write_text("x", encoding="utf-8")
+            old_utime = (now - timedelta(days=9999)).timestamp()
+            os.utime(stray_dir, (old_utime, old_utime))
+            os.utime(stray_file, (old_utime, old_utime))
+
+            with mock.patch.dict(
+                os.environ,
+                {"RUNS_DIR": runs, orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "30"},
+                clear=False,
+            ):
+                removed = orchestrator.cleanup_old_runs(now=now)
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(stray_dir.exists())
+            self.assertTrue(stray_file.exists())
+
+    def test_allocate_only_job_dir_falls_back_to_mtime_without_crashing(self):
+        """A job dir that never got past allocate_job (two-phase creation,
+        issue #4) has no job.json yet -- cleanup must still age it off via
+        directory mtime instead of raising."""
+        now = datetime(2026, 8, 31, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as runs:
+            with mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False):
+                job_dir = orchestrator.allocate_job()
+            old_time = (now - timedelta(days=40)).timestamp()
+            os.utime(job_dir, (old_time, old_time))
+
+            with mock.patch.dict(
+                os.environ,
+                {"RUNS_DIR": runs, orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "30"},
+                clear=False,
+            ):
+                removed = orchestrator.cleanup_old_runs(now=now)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(job_dir.exists())
+
+    def test_rmtree_failure_on_one_dir_does_not_stop_cleanup_or_raise(self):
+        now = datetime(2026, 8, 31, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as runs:
+            broken_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=40))
+            other_old_dir = _seed_job_dir(Path(runs), created_at=now - timedelta(days=40))
+
+            real_rmtree = shutil.rmtree
+
+            def flaky_rmtree(path, *args, **kwargs):
+                # Compare by name, not full path equality: cleanup_old_runs
+                # walks get_runs_dir() as configured (RUNS_DIR, possibly the
+                # unresolved side of a symlink like macOS's /var ->
+                # /private/var), while broken_dir came back from create_job
+                # already .resolve()'d -- same directory, different string.
+                # Job dir names carry a random hex suffix, so this is safe.
+                if Path(path).name == broken_dir.name:
+                    raise OSError("permission denied")
+                return real_rmtree(path, *args, **kwargs)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"RUNS_DIR": runs, orchestrator.RUNS_RETENTION_DAYS_ENV_VAR: "30"},
+                    clear=False,
+                ),
+                mock.patch.object(orchestrator.shutil, "rmtree", side_effect=flaky_rmtree),
+                self.assertLogs("src.orchestrator", level="WARNING"),
+            ):
+                removed = orchestrator.cleanup_old_runs(now=now)
+
+            self.assertEqual(removed, 1)
+            self.assertTrue(broken_dir.exists())
+            self.assertFalse(other_old_dir.exists())
+
+    def test_failure_resolving_retention_settings_is_logged_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as runs:
+            with (
+                mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False),
+                mock.patch.object(
+                    orchestrator, "_runs_retention_days", side_effect=RuntimeError("boom")
+                ),
+                self.assertLogs("src.orchestrator", level="ERROR"),
+            ):
+                removed = orchestrator.cleanup_old_runs()
+
+            self.assertEqual(removed, 0)
+
+
+class PathRedactionTests(unittest.TestCase):
+    """Issue #26 (orchestrator.py portion only): text that can reach Discord
+    must not carry local absolute paths, while the local job/app log keeps
+    the full path for diagnosis."""
+
+    def test_missing_target_workdir_error_message_has_no_absolute_path(self):
+        with tempfile.TemporaryDirectory() as runs:
+            missing = Path(runs) / "missing-project"
+            with (
+                mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False),
+                self.assertRaises(ValueError) as ctx,
+            ):
+                orchestrator.create_job("테스트", str(missing), None)
+
+            message = str(ctx.exception)
+            self.assertNotIn(str(missing.parent), message)
+            self.assertNotIn(str(missing.resolve().parent), message)
+            # The redacted tail (the part that actually helps diagnose which
+            # request failed) must still be there.
+            self.assertIn("missing-project", message)
+
+    def test_missing_target_workdir_full_path_is_logged(self):
+        with tempfile.TemporaryDirectory() as runs:
+            missing = Path(runs) / "missing-project"
+            with (
+                mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False),
+                self.assertLogs("src.orchestrator", level="WARNING") as logs,
+                self.assertRaises(ValueError),
+            ):
+                orchestrator.create_job("테스트", str(missing), None)
+
+            self.assertTrue(any(str(missing) in line for line in logs.output))
+
+    def test_run_job_missing_claude_cwd_error_text_has_no_absolute_path(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as runs, tempfile.TemporaryDirectory() as project:
+                with mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False):
+                    job_dir = orchestrator.create_job("테스트", project, None)
+
+                gone = Path(project) / "gone"
+                job_meta = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+                job_meta["workdir"] = str(gone)
+                (job_dir / "job.json").write_text(
+                    json.dumps(job_meta, ensure_ascii=False), encoding="utf-8"
+                )
+                return await orchestrator.run_job(job_dir), gone
+
+        meta, gone = asyncio.run(scenario())
+        self.assertNotIn(str(gone.parent), meta["text"])
+        self.assertIn("gone", meta["text"])
+
+    def test_run_job_missing_claude_cwd_stream_log_keeps_full_path(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as runs, tempfile.TemporaryDirectory() as project:
+                with mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False):
+                    job_dir = orchestrator.create_job("테스트", project, None)
+
+                gone = Path(project) / "gone"
+                job_meta = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+                job_meta["workdir"] = str(gone)
+                (job_dir / "job.json").write_text(
+                    json.dumps(job_meta, ensure_ascii=False), encoding="utf-8"
+                )
+                await orchestrator.run_job(job_dir)
+                # Read while the tempdirs are still alive -- both go away the
+                # instant this `with` block exits, which a `return`
+                # statement here triggers immediately.
+                stream_log = (job_dir / "logs" / "stream.jsonl").read_text(encoding="utf-8")
+                return stream_log, gone
+
+        stream_log, gone = asyncio.run(scenario())
+        self.assertIn(str(gone), stream_log)
+
+    def test_run_job_missing_claude_cwd_on_event_receives_redacted_text(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as runs, tempfile.TemporaryDirectory() as project:
+                with mock.patch.dict(os.environ, {"RUNS_DIR": runs}, clear=False):
+                    job_dir = orchestrator.create_job("테스트", project, None)
+
+                gone = Path(project) / "gone"
+                job_meta = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+                job_meta["workdir"] = str(gone)
+                (job_dir / "job.json").write_text(
+                    json.dumps(job_meta, ensure_ascii=False), encoding="utf-8"
+                )
+                seen = []
+                await orchestrator.run_job(job_dir, on_event=seen.append)
+                return seen, gone
+
+        seen, gone = asyncio.run(scenario())
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn(str(gone.parent), seen[0]["text"])

@@ -1,12 +1,14 @@
 import json
 import logging
 import os
+import shutil
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Self
 
+from src.errors import redact_paths
 from src.runner import JobProcessScope, run_claude_stream
 from src.timing import SPAN_RESULT, JobTimings
 
@@ -15,6 +17,13 @@ logger = logging.getLogger(__name__)
 JOB_META = "job.json"
 SESSION_STATE = "session_state.json"
 RESULT_META = "meta.json"
+
+# Issue #22: name is fixed so it matches the .env.example/README entries a
+# different worker is writing against this exact name. Default is 30 days;
+# see _runs_retention_days for why "unset" and "explicitly blank/0" are
+# treated differently.
+RUNS_RETENTION_DAYS_ENV_VAR = "RUNS_RETENTION_DAYS"
+DEFAULT_RUNS_RETENTION_DAYS = 30
 
 
 def get_runs_dir() -> Path:
@@ -27,8 +36,138 @@ def _resolve_target_workdir(workdir: str | None) -> Path | None:
 
     target = Path(workdir).expanduser()
     if not target.is_dir():
-        raise ValueError(f"작업 디렉터리가 없습니다: {target}")
+        # Issue #26: this ValueError's str() reaches Discord verbatim via
+        # main.py's `실행 불가: {exc}` handler, so the raised message must not
+        # carry the raw path. The unredacted path still goes to the app log
+        # right here -- redaction is a user-text-only concern, not a logging
+        # one (see src/errors.py's module docstring).
+        logger.warning("Requested workdir does not exist: %s", target)
+        raise ValueError(f"작업 디렉터리가 없습니다: {redact_paths(str(target))}")
     return target.resolve()
+
+
+def _runs_retention_days() -> int | None:
+    """Resolve RUNS_RETENTION_DAYS into a day count, or None to skip cleanup
+    entirely (issue #22).
+
+    The var being absent is the common case (nobody has touched their .env
+    yet), so that gets the documented default rather than silently disabling
+    cleanup. An env var explicitly set to "" or "0" is the escape hatch for
+    someone who wants cleanup off without deleting the line from their .env --
+    that is deliberately different from "unset", which is why this reads
+    os.environ directly instead of through .get(..., default).
+
+    A value that fails to parse, or a negative day count, falls back to the
+    default rather than being treated as the off-switch: silently reading a
+    typo as "disable cleanup" would just reproduce the unbounded-disk-growth
+    bug this function exists to fix.
+    """
+    if RUNS_RETENTION_DAYS_ENV_VAR not in os.environ:
+        return DEFAULT_RUNS_RETENTION_DAYS
+
+    raw = os.environ[RUNS_RETENTION_DAYS_ENV_VAR].strip()
+    if raw in ("", "0"):
+        return None
+
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not an integer; using default of %d days",
+            RUNS_RETENTION_DAYS_ENV_VAR,
+            raw,
+            DEFAULT_RUNS_RETENTION_DAYS,
+        )
+        return DEFAULT_RUNS_RETENTION_DAYS
+
+    if value < 0:
+        logger.warning(
+            "%s=%d is negative; using default of %d days",
+            RUNS_RETENTION_DAYS_ENV_VAR,
+            value,
+            DEFAULT_RUNS_RETENTION_DAYS,
+        )
+        return DEFAULT_RUNS_RETENTION_DAYS
+
+    return value
+
+
+def _job_dir_age_reference(job_dir: Path) -> datetime | None:
+    """Best-effort "how old is this job" timestamp for retention purposes.
+
+    Prefers job.json's created_at (written once by prepare_job and never
+    touched again) over the directory's own mtime: appending to
+    logs/stream.jsonl does not necessarily bump a directory's mtime, which
+    would make a long-idle job dir look artificially fresh. Falls back to the
+    directory's mtime for a job that never got past allocate_job (no job.json
+    yet) or whose job.json is unreadable.
+    """
+    meta = _load_json_object(job_dir / JOB_META)
+    created_at = meta.get("created_at")
+    if isinstance(created_at, str):
+        try:
+            parsed = datetime.fromisoformat(created_at)
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed
+
+    try:
+        return datetime.fromtimestamp(job_dir.stat().st_mtime, tz=UTC)
+    except OSError:
+        return None
+
+
+def cleanup_old_runs(*, now: datetime | None = None) -> int:
+    """Delete job directories under get_runs_dir() past RUNS_RETENTION_DAYS.
+
+    Issue #22: this bot's recommended deployment is to stay running
+    (launchd / Task Scheduler) indefinitely, and every turn allocates a new
+    job-xxxx directory that is never otherwise removed -- disk usage climbs
+    monotonically until the operator notices because the disk is full.
+    Called once at bot startup (the simplest point that does not need its own
+    scheduler): a long-running process's disk usage then only grows within
+    one retention window instead of forever, and a fresh cleanup on every
+    restart means a changed RUNS_RETENTION_DAYS takes effect promptly rather
+    than waiting for some later periodic tick.
+
+    Never raises: a bad RUNS_DIR permission setup, a race with another
+    process, or any other failure here must not stop the bot from starting.
+    Every failure -- resolving the env var, listing the runs dir, deleting one
+    specific job dir -- is caught and logged (full paths, since this goes to
+    the app log, not Discord); only directories actually removed count toward
+    the returned total.
+    """
+    try:
+        retention_days = _runs_retention_days()
+        if retention_days is None:
+            return 0
+
+        runs_dir = get_runs_dir()
+        if not runs_dir.is_dir():
+            return 0
+
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=retention_days)
+        entries = list(runs_dir.iterdir())
+    except Exception:
+        logger.exception("Run directory cleanup failed before it could start")
+        return 0
+
+    removed = 0
+    for entry in entries:
+        try:
+            if not entry.is_dir() or not entry.name.startswith("job-"):
+                continue
+            age_ref = _job_dir_age_reference(entry)
+            if age_ref is None or age_ref >= cutoff:
+                continue
+            shutil.rmtree(entry)
+            removed += 1
+        except Exception:
+            logger.warning("Failed to remove stale run directory %s", entry, exc_info=True)
+    return removed
 
 
 # Issue #5: this block used to be re-typed into the user-message body of
@@ -179,7 +318,7 @@ def prepare_job(
         json.dumps(
             {
                 "id": job_id,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
                 "workdir": str(target_workdir) if target_workdir else None,
                 "job_dir": str(job_dir),
                 "system_prompt": _build_system_prompt(system_hint),
@@ -217,19 +356,24 @@ async def run_job(
     system_prompt = job_meta.get("system_prompt")
 
     if not claude_cwd.is_dir():
-        event = {
-            "type": "error",
-            "text": f"Claude CLI 작업 디렉터리가 없습니다: {claude_cwd}",
-            "returncode": None,
-        }
+        detail = f"Claude CLI 작업 디렉터리가 없습니다: {claude_cwd}"
+        event = {"type": "error", "text": detail, "returncode": None}
         with _StreamWriter(job_dir) as writer:
+            # Full path kept here -- stream.jsonl is a local diagnostic log
+            # under job_dir, not something that reaches Discord.
             writer.write(event)
+
+        # Issue #26: everything past this point is user-facing (on_event
+        # feeds Discord progress edits; the returned dict's "text" is what
+        # main.py sends verbatim on a failed job), so redact before either
+        # one sees it.
+        user_event = {**event, "text": redact_paths(detail)}
         if on_event is not None:
             try:
-                on_event(event)
+                on_event(user_event)
             except Exception:
                 logger.exception("on_event callback raised for job %s", job_dir)
-        result = {**event, "text_body": ""}
+        result = {**user_event, "text_body": ""}
         if timings is not None:
             result["timings"] = timings.snapshot()
         return result
