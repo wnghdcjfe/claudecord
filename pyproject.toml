@@ -31,3 +31,29 @@ dev = [
 # sys.path explicitly.
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Pinned in the repo so `ruff check` answers the same locally and in CI, and so
+# "what does this project consider a lint error" has one place to look (#21).
+#
+# E501 is deliberately absent: several lines are single Korean prompt strings
+# sent to the model, and wrapping them would change the text or bury it in
+# concatenation. Also absent, after looking at what each one actually flagged
+# here:
+#   FLY002 - wants the SAFE_TOOLS/BLOCKED_TOOLS lists collapsed into f-strings.
+#            The one-entry-per-line list is what makes them reviewable.
+#   BLE001 - flags `except Exception` in the message handler, where catching
+#            everything is the point: one bad message must not kill the bot.
+#   PLR (bulk) - PLR0913/0912/0915 want src/runner.py's spawn helpers split up
+#            on argument and branch counts alone. PLR0402 is kept because it is
+#            about import style, not shape.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "C4", "RUF", "FURB", "PLR0402"]
+
+[tool.ruff.lint.per-file-ignores]
+# load_dotenv() must run before `from src.auth import ...`, because importing
+# src.main is how the bot loads its .env. Sorting these imports stops the bot
+# from starting -- see the comment at the top of the file.
+"src/main.py" = ["E402", "I001"]

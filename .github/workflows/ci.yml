@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    # Windows is a supported target -- the repo ships setup.ps1, run_bot.ps1 and
+    # register_scheduled_task.ps1 -- but the suite has never been run there, so
+    # it reports without blocking until someone has watched it go green.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.13"]
+        include:
+          - os: windows-latest
+            python-version: "3.11"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # 3.11 is the floor declared in pyproject; 3.13 catches deprecations
+      # early (discord.py still imports the removed-in-3.13 audioop).
+      - run: uv sync --group dev --python ${{ matrix.python-version }}
+      # No env vars here on purpose: needing OWNER_DISCORD_ID to *collect*
+      # tests was the bug in #9, so an unset environment is the regression test.
+      - run: uv run --no-sync pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --group dev
+      - run: uv run --no-sync ruff check .
