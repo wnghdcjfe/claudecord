@@ -1,7 +1,9 @@
 import asyncio
+import builtins
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -769,6 +771,33 @@ class SvgRendererFallbackTests(unittest.TestCase):
 
             self.assertIsNone(result)
             self.assertTrue(any("art.svg" in message for message in logs.output))
+
+
+    def test_cairosvg_import_raising_oserror_is_not_fatal(self):
+        # cairosvg imports cairocffi, which dlopens libcairo at import time
+        # and raises OSError -- not ImportError -- when the system library is
+        # missing. That is the state a user lands in after `pip install
+        # cairosvg` with no system cairo. If it escapes, it unwinds through
+        # send_outputs and the job reports success with no attachments at all.
+        def exploding_import(name, *args, **kwargs):
+            if name == "cairosvg":
+                raise OSError('no library called "cairo-2" was found')
+            return real_import(name, *args, **kwargs)
+
+        real_import = builtins.__import__
+
+        with tempfile.TemporaryDirectory() as tmp:
+            job_dir = Path(tmp)
+            svg_path = self._write_svg(job_dir)
+
+            with mock.patch("src.outputs.shutil.which", return_value=None), \
+                    mock.patch.dict("sys.modules", {}, clear=False), \
+                    mock.patch("builtins.__import__", exploding_import):
+                sys.modules.pop("cairosvg", None)
+                self.assertFalse(outputs._run_cairosvg(svg_path, job_dir / "out.png"))
+                result = outputs._render_svg_preview(svg_path)
+
+            self.assertIsNone(result)
 
 
 class AttachmentPathsForTests(unittest.TestCase):
