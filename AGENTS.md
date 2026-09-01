@@ -15,6 +15,7 @@ Discord 봇으로 로컬 PC의 Claude Code CLI를 원격 조종하는 파이썬 
 | `README.md` | 한국어 사용자 문서. Discord 앱 생성 → 권한 설정 → ID 확보 → `.env` 작성 → 실행 순서와 성능 튜닝 변수 표 |
 | `LICENSE` | MIT. `pyproject.toml`의 `license-files`가 이 파일을 가리킨다 |
 | `working_m.gif` | 작업 중 상태 메시지에 첨부되는 애니메이션 (192KB). `src/status.py`가 참조하며 `WORKING_GIF=1`일 때만 쓰인다 |
+| `.gitignore` | `projects.toml`(개인 설정), `.venv`, 런타임 상태 디렉터리를 추적에서 빼는 곳. 개인 경로가 담긴 파일을 새로 만들면 여기부터 확인할 것 |
 | `logo.png`, `example.jpeg` | README용 이미지 |
 
 ## Subdirectories
@@ -26,7 +27,7 @@ Discord 봇으로 로컬 PC의 Claude Code CLI를 원격 조종하는 파이썬 
 | `scripts/` | macOS(bash)/Windows(PowerShell) 셋업·실행·상시구동 스크립트 (see `scripts/AGENTS.md`) |
 | `examples/` | Claude CLI `stream-json` 이벤트 샘플 (see `examples/AGENTS.md`) |
 | `.github/` | GitHub Actions CI. 3개 OS × 파이썬 2버전 테스트 + 린트 (see `.github/AGENTS.md`) |
-| `.omc/` | oh-my-claudecode 런타임 상태. 애플리케이션과 무관하며 커밋 대상이 아님 |
+| `.omc/`, `.omx/` | 외부 도구(oh-my-claudecode 등)의 런타임 상태. 애플리케이션과 무관하고 추적되지 않으며, AGENTS.md 대상도 아니다 |
 
 ## For AI Agents
 
