@@ -28,22 +28,30 @@ $Command = "& { Set-Location -LiteralPath $RootLiteral; & $PythonLiteral -m src.
 $Action = New-ScheduledTaskAction `
     -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command $Command"
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
+# Scope the trigger to the current user: an unscoped -AtLogOn fires for every
+# user, and registering that needs an elevated shell (Access is denied).
+$Trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
+# -ExecutionTimeLimit 0 disables the default 72h limit, which would otherwise
+# kill the long-running bot after three days.
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1)
 
+# ScheduledTasks cmdlets ignore $ErrorActionPreference, so a failed
+# registration would fall through to the success message without -ErrorAction.
 Register-ScheduledTask `
     -TaskName $TaskName `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
     -Description "Run discord-claude-assistant at user logon." `
-    -Force | Out-Null
+    -Force `
+    -ErrorAction Stop | Out-Null
 
-Start-ScheduledTask -TaskName $TaskName
+Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
 
 Write-Host "registered and started scheduled task: $TaskName"
 Write-Host "log: $LogPath"
